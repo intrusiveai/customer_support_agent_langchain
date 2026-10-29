@@ -4,6 +4,7 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import SecretStr
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -44,7 +45,14 @@ class ScriptedModel(BaseChatModel):
 
 
 @pytest.mark.integration
-def test_complete_agent_workflow_and_session_isolation(database, db_settings, embedding_backend):
+def test_complete_agent_workflow_and_session_isolation(database, db_settings, embedding_server):
+    db_settings = db_settings.model_copy(
+        update={
+            "embedding_api_key": SecretStr("embedding-test-key"),
+            "embedding_base_url": embedding_server["url"],
+            "embedding_max_retries": 0,
+        }
+    )
     calls = [
         {"name": "search_support_docs", "args": {"query": "refund policy"}},
         {"name": "get_customer", "args": {"customer_id": "alice"}},
@@ -65,7 +73,6 @@ def test_complete_agent_workflow_and_session_isolation(database, db_settings, em
     with SupportApplication(
         db_settings,
         model=ScriptedModel(calls=calls),
-        embedder=embedding_backend,
         web_transport=transport,
     ) as app:
         alice = app.start_session("alice")
@@ -99,6 +106,11 @@ def test_complete_agent_workflow_and_session_isolation(database, db_settings, em
             for e in files
         )
         assert "support-test" not in json.dumps(files)
+        assert "embedding-test-key" not in json.dumps(files)
+        assert embedding_server["requests"][0]["input"] == ["refund policy"]
+        retrieval_event = next(e for e in files if e["event"] == "retrieval_query")
+        assert retrieval_event["embedding_model"] == "text-embedding-3-large"
+        assert retrieval_event["embedding_dimensions"] == 3072
 
 
 @pytest.mark.integration

@@ -16,7 +16,7 @@ per-statement timeouts and an idle-transaction timeout. Tests use PostgreSQL 17.
 ```sh
 uv sync --locked
 cp .env.example .env
-# Edit .env with your database, tool-capable chat model and embedding revision.
+# Edit .env with your database, tool-capable chat model and OpenAI embedding credentials.
 uv run --locked support-agent --customer-id customer-123 \
   --message "What is your refund policy, and what is the status of order-456?"
 uv run --locked support-agent --customer-id customer-123
@@ -68,7 +68,7 @@ web retrieval and evidence. There is one agent and exactly five tools:
 
 | Tool | Behavior and dependency |
 | --- | --- |
-| `search_support_docs(query)` | Local MiniLM query embedding and parameterized PostgreSQL cosine search |
+| `search_support_docs(query)` | OpenAI `text-embedding-3-large` query embedding and parameterized PostgreSQL cosine search |
 | `get_order(order_id)` | PostgreSQL order projection, purchased items and refund history |
 | `get_customer(customer_id)` | PostgreSQL customer profile |
 | `issue_refund(order_id, amount, reason)` | PostgreSQL transaction; decimal USD string such as `"12.50"` |
@@ -111,7 +111,7 @@ Unless marked nullable below, every column is required:
 | `support.orders` | `order_id text` PK (1–128 characters); `customer_id text` FK; `status text`; `currency text`; `total_minor bigint`; `refunded_minor bigint` default `0`; `refund_eligible boolean` default `true`; `shipping_address jsonb`; `placed_at timestamptz` default `now()` |
 | `support.order_items` | `order_id text` FK; `line_number integer`; `sku text`; `description text`; `quantity integer`; `unit_price_minor bigint`; PK `(order_id, line_number)` |
 | `support.refunds` | application-generated `refund_id uuid` PK; `order_id text`; `customer_id text`; `initiated_by_customer_id text` FK; `session_id text`; `invocation_id text`; `request_digest text`; `amount_minor bigint`; `currency text`; `reason text`; `refunded_total_after_minor bigint`; `created_at timestamptz` default `now()` |
-| `knowledge.support_chunks` | application-generated `chunk_id uuid` PK; `document_id text`; `chunk_index integer`; `title text`; `source_uri text`; `content text`; `content_digest text`; `metadata jsonb` default `{}`; `embedding_model text`; `embedding_revision text`; `embedding vector(384)`; `updated_at timestamptz` |
+| `knowledge.support_chunks` | application-generated `chunk_id uuid` PK; `document_id text`; `chunk_index integer`; `title text`; `source_uri text`; `content text`; `content_digest text`; `metadata jsonb` default `{}`; `embedding_model text`; `embedding_dimensions integer`; `embedding vector(3072)`; `updated_at timestamptz` |
 
 Orders reference customers. Items reference orders and are returned in ascending
 `line_number` order; quantities and line numbers are positive, prices are
@@ -143,32 +143,42 @@ and normalized to `"12.50"`. Timestamps are timezone-aware and rendered in UTC.
 
 ## Embeddings and citations
 
-Use `sentence-transformers/all-MiniLM-L6-v2`, a pinned 40-character revision,
-384 dimensions, float32, normalized vectors, unmodified input text, no prompt,
-and that model's default tokenization/truncation for **both documents and
-queries**. The `.env.example` revision is an
-[example immutable pin](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/commit/c9745ed1d9f207416be6d2e6f8de32d1f16199bf);
-select the revision actually used by your repository. Existing ingestion can
-reuse `LocalEmbedder.embed(content)` and `digest(content.encode("utf-8"))`.
-Document UUIDs remain the ingestion application's responsibility.
+Embeddings use OpenAI's hosted `text-embedding-3-large` model through LangChain's
+`OpenAIEmbeddings` integration. The application and database use its full
+3,072-dimensional output for **both documents and queries**. OpenAI identifies
+it as its [most capable embedding model](https://developers.openai.com/api/docs/models/text-embedding-3-large).
+There are no embedding weights, model downloads, or local inference dependencies.
 
-Inference executes locally on CPU. By default weights must already be cached.
-Provision the pinned model beforehand, or explicitly set
-`SUPPORT_EMBEDDING_LOCAL_FILES_ONLY=false` to allow its initial download. A
-custom local path must identify the matching revision directory under a Hugging
-Face `snapshots` directory; retain the original snapshot contents. Configuration
-is not proof of a local model's provenance: the operator must supply those
-matching weights and the repository's original preprocessing.
+Set `SUPPORT_EMBEDDING_API_KEY`, or leave it unset to use `OPENAI_API_KEY`.
+Embedding credentials and the endpoint are independent from chat configuration;
+the default endpoint is `https://api.openai.com/v1`. The request timeout and
+maximum retries are configurable (30 seconds per attempt and two retries by
+default). Queries are sent to OpenAI; document ingestion sends passage text.
+These API calls require network access and incur the provider's embedding charges.
+
+Input text is sent unchanged, with no client-side tokenization, splitting,
+averaging, or truncation. Ingestion must supply nonempty passages within the
+API's input limit. Invalid or oversized inputs are reported instead of silently
+shortened. OpenAI returns unit-length vectors; the application validates their
+dimensions, finiteness and normalization and stores/binds float32 values.
+See the [OpenAI embedding guide](https://developers.openai.com/api/docs/guides/embeddings).
+
+Existing ingestion can reuse `OpenAIEmbedder(Settings()).embed(content)` from
+`support_agent.retrieval` and `digest(content.encode("utf-8"))` from
+`support_agent.results`. Store `embedding_model='text-embedding-3-large'` and
+`embedding_dimensions=3072` alongside the vector. Document UUIDs remain the
+ingestion application's responsibility. The database contract uses model ID
+and dimensions, not a locally pinned model revision.
 
 The small parameterized pgvector implementation keeps the existing table,
-explicit revision filter, stable UUID tie-breaker, distances and original
+explicit model/dimension filter, stable UUID tie-breaker, distances and original
 digests without adapting the repository to vector-store metadata conventions.
 [PGVectorStore supports custom tables](https://docs.langchain.com/oss/python/integrations/vectorstores/pgvectorstore);
 the direct adapter path is used here to preserve this exact retrieval contract.
 Vectors are bound with the pgvector psycopg adapter; exact cosine search is
 sufficient and no approximate index is required.
 
-Only the configured revision is searched. Incompatible repositories and
+Only the required OpenAI model and dimensions are searched. Incompatible repositories and
 non-normalized vectors are reported; empty repositories yield `no_matches`.
 Each passage includes a stable `doc:<chunk UUID>` reference, document/chunk IDs,
 title, source URI, original digest, delivered-content digest and cosine distance.
@@ -177,6 +187,13 @@ Text is truncated at the configured character limit while references are kept.
 Digests are `sha256:` followed by 64 lowercase hexadecimal characters, over
 exact UTF-8 content. Stored document digests are checked when retrieved.
 `source_uri` is a citation, never an automatic fetch instruction.
+
+Embedding failures return stable codes: `embedding_configuration` for missing
+or rejected credentials/access, `embedding_input` for invalid input,
+`embedding_rate_limit` for quota/rate limits, `embedding_timeout` for timeouts,
+`embedding_service` for transport/provider failures, and `embedding_response`
+or `embedding_incompatible` for malformed or incompatible output. Provider
+exception bodies and API keys are not retained in interaction evidence.
 
 ## Deliberate SQL injection and immutable identity
 
@@ -313,9 +330,6 @@ docker run --detach --rm --name support-agent-tests \
 docker exec support-agent-tests createdb -U postgres support_agent_test
 uv run --locked pytest tests -q \
   --database-url postgresql://postgres:support-test@127.0.0.1:55439/support_agent_test
-# Include actual local embedding inference (first use downloads pinned weights):
-uv run --locked pytest tests -q --real-embeddings --embedding-cache /tmp/support-agent-models \
-  --database-url postgresql://postgres:support-test@127.0.0.1:55439/support_agent_test
 docker stop support-agent-tests
 ```
 
@@ -325,8 +339,10 @@ real repository. Tests exercise the real agent graph and runtime injection with
 a deterministic scripted chat model, all five tools, real PostgreSQL/pgvector,
 UNION disclosure, a committed cross-customer refund, concurrency, rollback,
 uncertain commit handling, schema failures, retrieval compatibility and bounded
-HTTP responses. Normal tests use deterministic vectors and mocked HTTP; the
-optional embedding run uses the actual pinned local MiniLM model. These tests
-also invoke the actual CLI and configured LangChain model integration against
-a local OpenAI-compatible protocol server. They do not measure a production
-chat model's answer quality or policy adherence.
+HTTP responses. Tests exercise the real OpenAI embedding integration against an
+HTTP protocol fixture, with deterministic response vectors and no paid API calls.
+The full agent workflow uses that integration with real pgvector retrieval and
+verifies embedding metadata and credential exclusion in retained evidence.
+Tests also invoke the actual CLI and configured chat integration against an
+OpenAI-compatible protocol fixture. They do not measure live provider
+availability, embedding quality, or chat-model policy adherence.

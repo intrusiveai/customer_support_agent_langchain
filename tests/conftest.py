@@ -1,5 +1,8 @@
 import os
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from uuid import uuid4
 
 import numpy as np
@@ -8,18 +11,16 @@ import pytest
 from pgvector.psycopg import register_vector
 from psycopg.conninfo import conninfo_to_dict
 
-from support_agent.config import EMBEDDING_MODEL, Settings
+from support_agent.config import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL, Settings
 from support_agent.context import ToolContext
 from support_agent.database import Database
 from support_agent.evidence import Evidence
 from support_agent.results import digest
 
-REVISION = "c9745ed1d9f207416be6d2e6f8de32d1f16199bf"
-
 
 class UnitEmbedder:
     def embed(self, query):
-        vector = np.zeros(384, dtype=np.float32)
+        vector = np.zeros(EMBEDDING_DIMENSIONS, dtype=np.float32)
         vector[0] = 1
         return vector
 
@@ -28,27 +29,56 @@ def pytest_addoption(parser):
     parser.addoption(
         "--database-url", default=None, help="Disposable PostgreSQL database ending in _test"
     )
-    parser.addoption(
-        "--real-embeddings", action="store_true", help="Download/use pinned local MiniLM weights"
-    )
-    parser.addoption("--embedding-cache", default="/tmp/support-agent-models")
 
 
-@pytest.fixture(scope="session")
-def embedding_backend(request):
-    if not request.config.getoption("--real-embeddings"):
-        return UnitEmbedder()
-    from support_agent.retrieval import LocalEmbedder
+@pytest.fixture
+def embedding_server():
+    """HTTP protocol fixture, not an embedding model. No external credentials or inference."""
+    state = {"requests": [], "status": 200, "vector": UnitEmbedder().embed("").tolist()}
 
-    settings = Settings(
-        _env_file=None,
-        database_url="postgresql://unused/unused",
-        model_name="test",
-        embedding_revision=REVISION,
-        embedding_local_files_only=False,
-        embedding_cache_path=Path(request.config.getoption("--embedding-cache")),
-    )
-    return LocalEmbedder(settings)
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            state["requests"].append(request)
+            assert self.path == "/v1/embeddings"
+            assert self.headers["Authorization"] == "Bearer embedding-test-key"
+            assert request["model"] == EMBEDDING_MODEL
+            assert request["dimensions"] == EMBEDDING_DIMENSIONS
+            assert request["encoding_format"] == "float"
+            body = {
+                "object": "list",
+                "model": EMBEDDING_MODEL,
+                "data": [{"object": "embedding", "index": 0, "embedding": state["vector"]}],
+                "usage": {"prompt_tokens": 5, "total_tokens": 5},
+            }
+            if state["status"] != 200:
+                body = {
+                    "error": {
+                        "message": "sensitive provider diagnostic",
+                        "type": "test_error",
+                        "code": "test_error",
+                    }
+                }
+            encoded = json.dumps(body).encode()
+            self.send_response(state["status"])
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    state["url"] = f"http://127.0.0.1:{server.server_port}/v1"
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 @pytest.fixture
@@ -57,7 +87,7 @@ def settings(tmp_path):
         _env_file=None,
         database_url="postgresql://unused/unused",
         model_name="scripted-test",
-        embedding_revision=REVISION,
+        embedding_api_key=None,
         evidence_path=tmp_path / "evidence",
         result_limit=2,
     )
@@ -86,7 +116,7 @@ def db_settings(settings, database_url):
 
 
 @pytest.fixture
-def database(db_settings, embedding_backend):
+def database(db_settings):
     database = Database(db_settings)
     database.start()
     with database.pool.connection() as connection:
@@ -126,8 +156,8 @@ def database(db_settings, embedding_backend):
                 content,
                 digest(content.encode()),
                 EMBEDDING_MODEL,
-                REVISION,
-                embedding_backend.embed(content),
+                EMBEDDING_DIMENSIONS,
+                UnitEmbedder().embed(content),
             ),
         )
     yield database

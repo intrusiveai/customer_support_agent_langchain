@@ -2,7 +2,7 @@
 
 import re
 
-from .config import EMBEDDING_MODEL
+from .config import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL
 
 # '?' marks the one nullable column. All others must be NOT NULL.
 COLUMNS = {
@@ -10,7 +10,7 @@ COLUMNS = {
     "support.orders": "order_id:text customer_id:text status:text currency:text total_minor:bigint refunded_minor:bigint refund_eligible:boolean shipping_address:jsonb placed_at:timestamptz",
     "support.order_items": "order_id:text line_number:integer sku:text description:text quantity:integer unit_price_minor:bigint",
     "support.refunds": "refund_id:uuid order_id:text customer_id:text initiated_by_customer_id:text session_id:text invocation_id:text request_digest:text amount_minor:bigint currency:text reason:text refunded_total_after_minor:bigint created_at:timestamptz",
-    "knowledge.support_chunks": "chunk_id:uuid document_id:text chunk_index:integer title:text source_uri:text content:text content_digest:text metadata:jsonb embedding_model:text embedding_revision:text embedding:vector(384) updated_at:timestamptz",
+    "knowledge.support_chunks": f"chunk_id:uuid document_id:text chunk_index:integer title:text source_uri:text content:text content_digest:text metadata:jsonb embedding_model:text embedding_dimensions:integer embedding:vector({EMBEDDING_DIMENSIONS}) updated_at:timestamptz",
 }
 CONSTRAINTS = {
     "support.customers": [
@@ -56,7 +56,7 @@ CONSTRAINTS = {
         "CHECK (content_digest ~ '^sha256:[0-9a-f]{64}$')",
         "CHECK (jsonb_typeof(metadata) = 'object')",
         f"CHECK (embedding_model = '{EMBEDDING_MODEL}')",
-        "CHECK (embedding_revision ~ '^[0-9a-f]{40}$')",
+        f"CHECK (embedding_dimensions = {EMBEDDING_DIMENSIONS})",
     ],
 }
 DEFAULTS = {

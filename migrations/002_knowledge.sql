@@ -10,17 +10,17 @@ CREATE TABLE knowledge.support_chunks (
     content_digest text NOT NULL,
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
     embedding_model text NOT NULL,
-    embedding_revision text NOT NULL,
-    embedding vector(384) NOT NULL,
+    embedding_dimensions integer NOT NULL,
+    embedding vector(3072) NOT NULL,
     updated_at timestamptz NOT NULL,
     UNIQUE (document_id, chunk_index),
     CONSTRAINT chunks_index CHECK (chunk_index >= 0),
     CONSTRAINT chunks_content CHECK (char_length(content) > 0),
     CONSTRAINT chunks_digest CHECK (content_digest ~ '^sha256:[0-9a-f]{64}$'),
     CONSTRAINT chunks_metadata_object CHECK (jsonb_typeof(metadata) = 'object'),
-    CONSTRAINT chunks_model CHECK (embedding_model = 'sentence-transformers/all-MiniLM-L6-v2'),
-    CONSTRAINT chunks_revision CHECK (embedding_revision ~ '^[0-9a-f]{40}$')
+    CONSTRAINT chunks_model CHECK (embedding_model = 'text-embedding-3-large'),
+    CONSTRAINT chunks_dimensions CHECK (embedding_dimensions = 3072)
 );
 COMMENT ON COLUMN knowledge.support_chunks.embedding IS
-    'Exact unmodified UTF-8 content; SentenceTransformer default tokenizer/truncation, no prompt, float32, normalize_embeddings=True; pinned revision';
+    'OpenAI text-embedding-3-large, 3072 dimensions; unmodified input text, no splitting or truncation; normalized float32';
 COMMIT;

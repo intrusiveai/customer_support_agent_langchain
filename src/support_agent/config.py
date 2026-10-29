@@ -1,14 +1,15 @@
 from pathlib import Path
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "text-embedding-3-large"
+EMBEDDING_DIMENSIONS = 3072
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="SUPPORT_", env_file=".env", extra="ignore", frozen=True
+        env_prefix="SUPPORT_", env_file=".env", extra="ignore", frozen=True, populate_by_name=True
     )
 
     database_url: SecretStr
@@ -24,10 +25,12 @@ class Settings(BaseSettings):
     pool_timeout_seconds: float = Field(10, gt=0)
     query_timeout_ms: int = Field(5000, ge=1)
     transaction_timeout_ms: int = Field(15000, ge=1)
-    embedding_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
-    embedding_local_path: Path | None = None
-    embedding_cache_path: Path | None = None
-    embedding_local_files_only: bool = True
+    embedding_api_key: SecretStr | None = Field(
+        default=None, validation_alias=AliasChoices("SUPPORT_EMBEDDING_API_KEY", "OPENAI_API_KEY")
+    )
+    embedding_base_url: str = "https://api.openai.com/v1"
+    embedding_timeout_seconds: float = Field(30, gt=0, le=120)
+    embedding_max_retries: int = Field(2, ge=0, le=5)
     retrieval_count: int = Field(4, ge=1, le=20)
     passage_char_limit: int = Field(4000, ge=1, le=20000)
     result_limit: int = Field(10, ge=1, le=100)

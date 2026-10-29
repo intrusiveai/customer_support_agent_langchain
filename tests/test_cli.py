@@ -83,7 +83,6 @@ def test_cli_uses_configured_chat_integration_and_real_account_tool(
             "SUPPORT_MODEL_API_KEY": "local-test-only",
             "SUPPORT_MODEL_KWARGS": "{}",
             "SUPPORT_MODEL_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
-            "SUPPORT_EMBEDDING_REVISION": db_settings.embedding_revision,
             "SUPPORT_EVIDENCE_PATH": str(tmp_path / "cli-evidence"),
         }
         completed = subprocess.run(
