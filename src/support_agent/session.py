@@ -110,7 +110,7 @@ class SupportApplication:
                 return {
                     "session_id": session.session_id,
                     "interaction_id": context.interaction_id,
-                    "answer": messages[-1].content,
+                    "answer": messages[-1].text,
                 }
             except Exception as exc:
                 session._failed_interactions.add(context.interaction_id)

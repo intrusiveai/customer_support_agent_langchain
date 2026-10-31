@@ -1,10 +1,13 @@
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware
 from langchain.chat_models import init_chat_model
+from botocore.exceptions import BotoCoreError, ClientError
 
 from .accounts import Accounts
+from .aws import bedrock_client
 from .context import RuntimeContext
 from .retrieval import Retrieval
+from .results import Rejected
 from .tools import build_tools, retain_tool_evidence
 from .web import Web
 
@@ -22,21 +25,50 @@ that its ledger must be checked. Explain missing information and tool failures a
 These refunds are simulations and do not move real money."""
 
 
-def build_agent(settings, database, model=None, embedder=None, web_transport=None):
-    if model is None:
-        kwargs = dict(settings.model_kwargs)
+def build_chat_model(settings):
+    provider = {"claude": "anthropic", "bedrock": "bedrock_converse"}.get(
+        settings.model_provider, settings.model_provider
+    )
+    kwargs = dict(settings.model_kwargs)
+    kwargs["max_tokens"] = settings.model_max_tokens
+    if provider == "bedrock_converse":
+        # Converse uses signed AWS clients rather than API-key or OpenAI request options.
+        try:
+            kwargs.update(
+                client=bedrock_client(
+                    settings,
+                    timeout=settings.model_timeout_seconds,
+                    max_retries=0,
+                    endpoint_url=settings.model_base_url,
+                ),
+                bedrock_client=bedrock_client(
+                    settings,
+                    timeout=settings.model_timeout_seconds,
+                    max_retries=0,
+                    endpoint_url=settings.model_base_url,
+                    service="bedrock",
+                ),
+            )
+        except (BotoCoreError, ClientError, ValueError) as exc:
+            raise Rejected(
+                "model_configuration",
+                "Cannot configure Bedrock; check AWS region, profile and credentials.",
+            ) from exc
+    else:
         kwargs.update(
             timeout=settings.model_timeout_seconds,
-            max_tokens=settings.model_max_tokens,
             max_retries=0,
         )
         if settings.model_api_key:
             kwargs["api_key"] = settings.model_api_key.get_secret_value()
         if settings.model_base_url:
             kwargs["base_url"] = settings.model_base_url
-        model = init_chat_model(
-            settings.model_name, model_provider=settings.model_provider, **kwargs
-        )
+    return init_chat_model(settings.model_name, model_provider=provider, **kwargs)
+
+
+def build_agent(settings, database, model=None, embedder=None, web_transport=None):
+    if model is None:
+        model = build_chat_model(settings)
     tools = build_tools(
         Accounts(database, settings),
         Retrieval(database, settings, embedder),

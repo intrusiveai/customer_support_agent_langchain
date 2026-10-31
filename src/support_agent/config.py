@@ -1,10 +1,13 @@
 from pathlib import Path
+from typing import Literal
 
 from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 EMBEDDING_MODEL = "text-embedding-3-large"
 EMBEDDING_DIMENSIONS = 3072
+TITAN_EMBEDDING_MODEL = "amazon.titan-embed-text-v2:0"
+TITAN_EMBEDDING_DIMENSIONS = 1024
 
 
 class Settings(BaseSettings):
@@ -20,15 +23,18 @@ class Settings(BaseSettings):
     model_kwargs: dict = Field(default_factory=dict)
     model_timeout_seconds: float = Field(60, gt=0, le=600)
     model_max_tokens: int = Field(2048, ge=1)
+    aws_region: str | None = None
+    aws_profile: str | None = None
     pool_min: int = Field(1, ge=0)
     pool_max: int = Field(5, ge=1, le=100)
     pool_timeout_seconds: float = Field(10, gt=0)
     query_timeout_ms: int = Field(5000, ge=1)
     transaction_timeout_ms: int = Field(15000, ge=1)
+    embedding_provider: Literal["openai", "bedrock"] = "openai"
     embedding_api_key: SecretStr | None = Field(
         default=None, validation_alias=AliasChoices("SUPPORT_EMBEDDING_API_KEY", "OPENAI_API_KEY")
     )
-    embedding_base_url: str = "https://api.openai.com/v1"
+    embedding_base_url: str | None = None
     embedding_timeout_seconds: float = Field(30, gt=0, le=120)
     embedding_max_retries: int = Field(2, ge=0, le=5)
     retrieval_count: int = Field(4, ge=1, le=20)
@@ -45,6 +51,18 @@ class Settings(BaseSettings):
     user_message_char_limit: int = Field(20000, ge=1)
     session_message_limit: int = Field(200, ge=2)
     evidence_path: Path = Path("evidence")
+
+    @property
+    def embedding_model(self):
+        return TITAN_EMBEDDING_MODEL if self.embedding_provider == "bedrock" else EMBEDDING_MODEL
+
+    @property
+    def embedding_dimensions(self):
+        return (
+            TITAN_EMBEDDING_DIMENSIONS
+            if self.embedding_provider == "bedrock"
+            else EMBEDDING_DIMENSIONS
+        )
 
     @model_validator(mode="after")
     def validate_settings(self):

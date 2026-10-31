@@ -16,7 +16,7 @@ per-statement timeouts and an idle-transaction timeout. Tests use PostgreSQL 17.
 ```sh
 uv sync --locked
 cp .env.example .env
-# Edit .env with your database, tool-capable chat model and OpenAI embedding credentials.
+# Edit .env with your database, chat provider/model and embedding provider credentials.
 uv run --locked support-agent --customer-id customer-123 \
   --message "What is your refund policy, and what is the status of order-456?"
 uv run --locked support-agent --customer-id customer-123
@@ -29,12 +29,61 @@ before calling `start_session`. The authenticated customer must already exist.
 
 `SUPPORT_MODEL_PROVIDER`, `SUPPORT_MODEL_NAME`, `SUPPORT_MODEL_API_KEY`,
 `SUPPORT_MODEL_BASE_URL` and JSON `SUPPORT_MODEL_KWARGS` configure the existing
-LangChain chat integration. The locked default includes `langchain-openai` for
-OpenAI and compatible endpoints. For another provider, install and lock its
-LangChain integration, then select its provider name. Provider-specific options
-belong in `MODEL_KWARGS`; the selected integration must support tool calling and
-the configured `timeout`, `max_tokens`, and `max_retries` options. Model retries
-are disabled. No provider, endpoint or credential is selected by tool arguments.
+LangChain chat integration. OpenAI, Anthropic and AWS integrations are included
+in the lockfile. The selected chat model must support tool calling:
+
+| `SUPPORT_MODEL_PROVIDER` | Chat integration | Credentials and endpoint |
+| --- | --- | --- |
+| `openai` (default) | LangChain `ChatOpenAI` | `SUPPORT_MODEL_API_KEY`, or `OPENAI_API_KEY`; OpenAI-compatible base URLs supported |
+| `anthropic` or `claude` | LangChain `ChatAnthropic` | `SUPPORT_MODEL_API_KEY`, or `ANTHROPIC_API_KEY`; default Anthropic endpoint |
+| `bedrock` or `bedrock_converse` | LangChain `ChatBedrockConverse` | AWS SDK credential chain; regional Bedrock endpoints |
+
+Direct Claude example (choose a model ID available to your Anthropic account):
+
+```dotenv
+SUPPORT_MODEL_PROVIDER=anthropic
+SUPPORT_MODEL_NAME=your-claude-model-id
+SUPPORT_MODEL_API_KEY=your-anthropic-api-key
+SUPPORT_EMBEDDING_PROVIDER=openai
+SUPPORT_EMBEDDING_API_KEY=your-openai-api-key
+```
+
+Bedrock chat and Titan embeddings example:
+
+```dotenv
+SUPPORT_MODEL_PROVIDER=bedrock
+SUPPORT_MODEL_NAME=your-tool-capable-bedrock-model-or-inference-profile-id
+SUPPORT_EMBEDDING_PROVIDER=bedrock
+SUPPORT_AWS_REGION=us-east-1
+# Optional named profile for local use; omit for environment or role credentials.
+# SUPPORT_AWS_PROFILE=your-profile
+```
+
+Chat and embedding providers are independent: direct Claude or OpenAI chat can
+use Titan, and Bedrock chat can use OpenAI embeddings. Bedrock ignores the direct
+API-key settings. Use standard AWS credentials (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`), an AWS profile (including
+role/SSO profiles), or workload role credentials. `SUPPORT_AWS_PROFILE` selects a
+profile explicitly; otherwise the SDK's normal chain applies. Region selection
+uses `SUPPORT_AWS_REGION`, then `AWS_REGION`/`AWS_DEFAULT_REGION`, then the profile.
+Both Bedrock chat and embeddings share this region/profile configuration.
+
+Bedrock chat uses the [Converse integration](https://docs.langchain.com/oss/python/integrations/chat/bedrock).
+Use a tool-capable model or cross-region inference profile supported in your AWS
+account. AWS credentials need `bedrock:InvokeModel` for the selected chat and
+embedding resources. For application inference-profile ARNs, set the underlying
+provider in `SUPPORT_MODEL_KWARGS` (for example `{"provider":"anthropic"}`);
+the integration may need `bedrock:GetInferenceProfile` to resolve its base model.
+Model availability and resource permissions remain under your AWS account's control.
+
+Provider-specific options belong in `SUPPORT_MODEL_KWARGS`. Chat retries are
+disabled; chat timeout and output-token settings apply to all three providers.
+For Bedrock, timeouts and retry limits are set on the signed AWS SDK clients.
+Endpoint overrides remain optional: `SUPPORT_MODEL_BASE_URL` for chat and
+`SUPPORT_EMBEDDING_BASE_URL` for embeddings. Use the selected provider's URL
+format (OpenAI typically ends in `/v1`; Anthropic uses its API root; Bedrock uses
+a regional runtime endpoint). Remove overrides when switching back to provider
+defaults. No provider, endpoint or credential is selected by tool arguments.
 
 All limits, pool settings and paths are listed in [.env.example](.env.example).
 `uv.lock` pins the complete resolved dependency graph; use `--locked` for
@@ -54,7 +103,8 @@ with SupportApplication(Settings()) as app:
     print(second["answer"])
 ```
 
-The result contains `session_id`, `interaction_id`, and `answer`. Keep the
+The result contains `session_id`, `interaction_id`, and a plain-text `answer`,
+including when a provider returns structured content blocks. Keep the
 application/session objects for subsequent turns. Sessions have separate
 in-memory histories and immutable identities. Calls within a session are
 serialized; sessions can run independently. The API is synchronous; an async
@@ -68,7 +118,7 @@ web retrieval and evidence. There is one agent and exactly five tools:
 
 | Tool | Behavior and dependency |
 | --- | --- |
-| `search_support_docs(query)` | OpenAI `text-embedding-3-large` query embedding and parameterized PostgreSQL cosine search |
+| `search_support_docs(query)` | OpenAI or Bedrock Titan query embedding and parameterized PostgreSQL cosine search |
 | `get_order(order_id)` | PostgreSQL order projection, purchased items and refund history |
 | `get_customer(customer_id)` | PostgreSQL customer profile |
 | `issue_refund(order_id, amount, reason)` | PostgreSQL transaction; decimal USD string such as `"12.50"` |
@@ -111,7 +161,7 @@ Unless marked nullable below, every column is required:
 | `support.orders` | `order_id text` PK (1–128 characters); `customer_id text` FK; `status text`; `currency text`; `total_minor bigint`; `refunded_minor bigint` default `0`; `refund_eligible boolean` default `true`; `shipping_address jsonb`; `placed_at timestamptz` default `now()` |
 | `support.order_items` | `order_id text` FK; `line_number integer`; `sku text`; `description text`; `quantity integer`; `unit_price_minor bigint`; PK `(order_id, line_number)` |
 | `support.refunds` | application-generated `refund_id uuid` PK; `order_id text`; `customer_id text`; `initiated_by_customer_id text` FK; `session_id text`; `invocation_id text`; `request_digest text`; `amount_minor bigint`; `currency text`; `reason text`; `refunded_total_after_minor bigint`; `created_at timestamptz` default `now()` |
-| `knowledge.support_chunks` | application-generated `chunk_id uuid` PK; `document_id text`; `chunk_index integer`; `title text`; `source_uri text`; `content text`; `content_digest text`; `metadata jsonb` default `{}`; `embedding_model text`; `embedding_dimensions integer`; `embedding vector(3072)`; `updated_at timestamptz` |
+| `knowledge.support_chunks` | application-generated `chunk_id uuid` PK; `document_id text`; `chunk_index integer`; `title text`; `source_uri text`; `content text`; `content_digest text`; `metadata jsonb` default `{}`; `embedding_model text`; `embedding_dimensions integer`; `embedding vector`; `updated_at timestamptz` |
 
 Orders reference customers. Items reference orders and are returned in ascending
 `line_number` order; quantities and line numbers are positive, prices are
@@ -143,32 +193,47 @@ and normalized to `"12.50"`. Timestamps are timezone-aware and rendered in UTC.
 
 ## Embeddings and citations
 
-Embeddings use OpenAI's hosted `text-embedding-3-large` model through LangChain's
-`OpenAIEmbeddings` integration. The application and database use its full
-3,072-dimensional output for **both documents and queries**. OpenAI identifies
-it as its [most capable embedding model](https://developers.openai.com/api/docs/models/text-embedding-3-large).
+Select embeddings independently using `SUPPORT_EMBEDDING_PROVIDER`:
+
+| Provider | Model | Dimensions | Credentials |
+| --- | --- | --- | --- |
+| `openai` (default) | `text-embedding-3-large` | 3072 | `SUPPORT_EMBEDDING_API_KEY`, falling back to `OPENAI_API_KEY` |
+| `bedrock` | `amazon.titan-embed-text-v2:0` | 1024 | Standard AWS SDK credentials, region and optional profile described above |
+
+These model/dimension pairs are fixed by the selected provider for **both
+documents and queries**. OpenAI uses LangChain's `OpenAIEmbeddings`; Titan uses
+the AWS SDK's `InvokeModel` API to preserve exact text, request normalized float
+vectors and classify provider errors without retaining their response bodies.
 There are no embedding weights, model downloads, or local inference dependencies.
 
-Set `SUPPORT_EMBEDDING_API_KEY`, or leave it unset to use `OPENAI_API_KEY`.
-Embedding credentials and the endpoint are independent from chat configuration;
-the default endpoint is `https://api.openai.com/v1`. The request timeout and
-maximum retries are configurable (30 seconds per attempt and two retries by
-default). Queries are sent to OpenAI; document ingestion sends passage text.
+For OpenAI, the default endpoint is `https://api.openai.com/v1`; for Bedrock it
+is the regional runtime endpoint. Request timeouts and maximum retries are
+configurable (30-second request timeouts and two retries by default). Bedrock
+applies that timeout to both connection and response reads. Queries are sent to
+the selected provider; document ingestion sends passage text.
 These API calls require network access and incur the provider's embedding charges.
 
 Input text is sent unchanged, with no client-side tokenization, splitting,
 averaging, or truncation. Ingestion must supply nonempty passages within the
 API's input limit. Invalid or oversized inputs are reported instead of silently
-shortened. OpenAI returns unit-length vectors; the application validates their
+shortened. Titan V2 accepts up to 8,192 tokens or 50,000 characters; this
+implementation selects its full 1,024-dimensional float output and requests
+`normalize=true`. See the [Titan V2 contract](https://docs.aws.amazon.com/bedrock/latest/userguide/titan-embedding-models.html).
+Both providers return unit-length vectors; the application validates their
 dimensions, finiteness and normalization and stores/binds float32 values.
 See the [OpenAI embedding guide](https://developers.openai.com/api/docs/guides/embeddings).
 
-Existing ingestion can reuse `OpenAIEmbedder(Settings()).embed(content)` from
+Existing ingestion can reuse `build_embedder(Settings()).embed(content)` from
 `support_agent.retrieval` and `digest(content.encode("utf-8"))` from
-`support_agent.results`. Store `embedding_model='text-embedding-3-large'` and
-`embedding_dimensions=3072` alongside the vector. Document UUIDs remain the
-ingestion application's responsibility. The database contract uses model ID
-and dimensions, not a locally pinned model revision.
+`support_agent.results`. Store `settings.embedding_model` and
+`settings.embedding_dimensions` alongside the vector. Document UUIDs remain the
+ingestion application's responsibility. The database checks both the allowed
+model/dimension pair and `vector_dims(embedding) = embedding_dimensions`.
+The `vector` column accommodates either supported dimension; rows are filtered
+by model and dimension before cosine distances are computed. Different providers'
+vector spaces are never compared. Each document passage still has one embedding:
+switching providers requires populating the desired provider's document vectors,
+not simply changing a label. There is no fallback to another provider's vectors.
 
 The small parameterized pgvector implementation keeps the existing table,
 explicit model/dimension filter, stable UUID tie-breaker, distances and original
@@ -178,7 +243,7 @@ the direct adapter path is used here to preserve this exact retrieval contract.
 Vectors are bound with the pgvector psycopg adapter; exact cosine search is
 sufficient and no approximate index is required.
 
-Only the required OpenAI model and dimensions are searched. Incompatible repositories and
+Only the selected model and dimensions are searched. Incompatible repositories and
 non-normalized vectors are reported; empty repositories yield `no_matches`.
 Each passage includes a stable `doc:<chunk UUID>` reference, document/chunk IDs,
 title, source URI, original digest, delivered-content digest and cosine distance.
@@ -339,10 +404,11 @@ real repository. Tests exercise the real agent graph and runtime injection with
 a deterministic scripted chat model, all five tools, real PostgreSQL/pgvector,
 UNION disclosure, a committed cross-customer refund, concurrency, rollback,
 uncertain commit handling, schema failures, retrieval compatibility and bounded
-HTTP responses. Tests exercise the real OpenAI embedding integration against an
-HTTP protocol fixture, with deterministic response vectors and no paid API calls.
-The full agent workflow uses that integration with real pgvector retrieval and
-verifies embedding metadata and credential exclusion in retained evidence.
-Tests also invoke the actual CLI and configured chat integration against an
-OpenAI-compatible protocol fixture. They do not measure live provider
+HTTP responses. Tests exercise the real OpenAI, Anthropic and AWS SDK integrations
+against local HTTP protocol fixtures, with deterministic responses and no paid
+API calls. Five-tool workflows cover direct Claude, Bedrock Converse, and mixed
+chat/embedding providers with real pgvector retrieval. A table containing both
+OpenAI and Titan vectors verifies model/dimension filtering; evidence checks
+verify provider metadata and credential exclusion. Tests also invoke the CLI.
+They do not measure live provider
 availability, embedding quality, or chat-model policy adherence.
