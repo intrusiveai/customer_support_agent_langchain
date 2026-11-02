@@ -1,5 +1,6 @@
 from threading import Lock
 import json
+import math
 
 import numpy as np
 import openai
@@ -22,6 +23,9 @@ from .config import (
 )
 from .aws import bedrock_client
 from .results import Rejected, digest, result
+
+# Absolute unit-norm tolerance after float32 conversion, measured in float64.
+UNIT_NORM_ATOL = 1e-6
 
 
 class OpenAIEmbedder:
@@ -180,17 +184,49 @@ def build_embedder(settings):
 
 
 def validated_vector(value, dimensions=EMBEDDING_DIMENSIONS):
-    vector = np.asarray(value, dtype=np.float32)
-    if (
-        vector.shape != (dimensions,)
-        or not np.isfinite(vector).all()
-        or not np.isclose(np.linalg.norm(vector), 1, atol=1e-4)
+    """Validate and locally normalize provider vectors for both ingestion and search."""
+    expected = (dimensions,)
+    try:
+        vector = np.asarray(value)
+    except (ValueError, TypeError):
+        raise Rejected(
+            "embedding_dimensions",
+            f"Embedding expected shape={expected}; actual shape=unavailable (ragged or invalid array).",
+        ) from None
+    shape = f"expected shape={expected}; actual shape={vector.shape}"
+    if vector.shape != expected:
+        raise Rejected("embedding_dimensions", f"Embedding has invalid dimensions; {shape}.")
+    # Reject strings (even numeric strings), booleans, complex and object arrays;
+    # casting those directly could conceal an invalid provider response.
+    if vector.dtype.kind not in "iuf":
+        raise Rejected("embedding_numeric", f"Embedding must contain real numeric values; {shape}.")
+    with np.errstate(over="ignore", invalid="ignore"):
+        vector = vector.astype(np.float64)
+    # hypot avoids intermediate square overflow/underflow in a naive L2 norm.
+    norm = math.hypot(*vector)
+    diagnostic = f"{shape}; measured norm={norm:.17g}"
+    if not np.isfinite(vector).all():
+        raise Rejected(
+            "embedding_non_finite", f"Embedding contains non-finite values; {diagnostic}."
+        )
+    # Subnormal float64 norms have insufficient relative precision for safe division.
+    if not math.isfinite(norm) or norm < np.finfo(np.float64).tiny:
+        raise Rejected(
+            "embedding_norm",
+            f"Embedding norm is zero, non-finite or numerically unsafe; {diagnostic}.",
+        )
+    with np.errstate(under="ignore"):
+        normalized = (vector / norm).astype(np.float32)
+    normalized_norm = math.hypot(*normalized)
+    if not np.isfinite(normalized).all() or not math.isclose(
+        normalized_norm, 1.0, rel_tol=0, abs_tol=UNIT_NORM_ATOL
     ):
         raise Rejected(
-            "embedding_incompatible",
-            f"Embedding must be a normalized {dimensions}-dimensional vector.",
+            "embedding_normalization",
+            f"Embedding normalization failed; {diagnostic}; output norm={normalized_norm:.17g}; "
+            f"absolute tolerance={UNIT_NORM_ATOL}.",
         )
-    return vector
+    return normalized
 
 
 class Retrieval:
@@ -207,7 +243,7 @@ class Retrieval:
             embedding_provider=settings.embedding_provider,
             embedding_dimensions=settings.embedding_dimensions,
             normalize_embeddings=True,
-            preprocessing="unmodified text; no splitting or truncation; normalized float32",
+            preprocessing="unmodified text; no splitting or truncation; locally normalized float32",
         )
         with self.db.transaction(read_only=True) as tx:
             compatibility = tx.execute(
@@ -246,9 +282,11 @@ class Retrieval:
             ).fetchall()
         passages = []
         for row in rows:
-            if not np.isclose(row.pop("embedding_norm"), 1, atol=1e-4):
+            stored_norm = row.pop("embedding_norm")
+            if not np.isclose(stored_norm, 1, atol=1e-4):
                 raise Rejected(
-                    "embedding_incompatible", "Retrieved document embedding is not normalized."
+                    "embedding_incompatible",
+                    f"Retrieved document embedding is not normalized; measured norm={stored_norm:.17g}.",
                 )
             original = row["content"]
             if row["content_digest"] != digest(original.encode("utf-8")):

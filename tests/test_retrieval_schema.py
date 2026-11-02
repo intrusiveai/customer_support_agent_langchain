@@ -1,4 +1,6 @@
 import pytest
+import numpy as np
+from pgvector.psycopg import register_vector
 
 from support_agent.results import Rejected
 from support_agent.retrieval import Retrieval
@@ -28,6 +30,20 @@ def test_retrieval_truncation_digest_model_and_empty(database, db_settings, ctx)
     with database.transaction() as tx:
         tx.execute("DELETE FROM knowledge.support_chunks")
     assert retrieval.search(ctx, "refund")["outcome"] == "no_matches"
+
+
+def test_stored_nonunit_vectors_are_rejected_without_rewriting(database, db_settings, ctx):
+    vector = UnitEmbedder().embed("") * np.float32(1.0004726255)
+    with database.pool.connection() as connection:
+        register_vector(connection)
+        connection.execute("UPDATE knowledge.support_chunks SET embedding=%s", (vector,))
+    with pytest.raises(Rejected, match="measured norm=") as error:
+        Retrieval(database, db_settings, UnitEmbedder()).search(ctx, "refund")
+    assert error.value.code == "embedding_incompatible"
+    with database.pool.connection() as connection:
+        register_vector(connection)
+        stored = connection.execute("SELECT embedding FROM knowledge.support_chunks").fetchone()
+    np.testing.assert_array_equal(stored[0], vector)
 
 
 def test_startup_detects_missing_constraints_types_and_indexes(database, db_settings):

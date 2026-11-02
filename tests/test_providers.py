@@ -1,4 +1,5 @@
 import json
+import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from types import SimpleNamespace
@@ -32,7 +33,12 @@ def aws_credentials(monkeypatch):
 
 @pytest.fixture
 def provider_server(aws_credentials):
-    state = {"embedding_requests": [], "chat_requests": [], "embedding_status": 200}
+    state = {
+        "embedding_requests": [],
+        "chat_requests": [],
+        "embedding_status": 200,
+        "embedding_vector": [1.0] + [0.0] * 1023,
+    }
     calls = [
         ("search_support_docs", {"query": "refund policy"}),
         ("get_customer", {"customer_id": "alice"}),
@@ -66,9 +72,9 @@ def provider_server(aws_credentials):
                     return
                 self.respond(
                     {
-                        "embedding": [1.0] + [0.0] * 1023,
+                        "embedding": state["embedding_vector"],
                         "inputTextTokenCount": 5,
-                        "embeddingsByType": {"float": [1.0] + [0.0] * 1023},
+                        "embeddingsByType": {"float": state["embedding_vector"]},
                     }
                 )
                 return
@@ -117,6 +123,7 @@ def provider_server(aws_credentials):
                 call_id = f"provider-call-{len(results)}"
             else:
                 passage = results[0]["data"]["passages"][0]
+                assert abs(passage["distance"]) < 1e-6
                 assert results[3]["outcome"] == "committed"
                 answer = f"Policy [{passage['reference']}]({passage['source_uri']}). Refund committed: {results[3]['data']['amount']}."
             if provider == "anthropic":
@@ -230,14 +237,29 @@ def test_provider_agent_workflows(
     )
     # Populate the selected model through its real SDK integration; keep a second model's
     # vector in the same table to prove the cosine query never compares incompatible spaces.
+    # Reproduce the campaign's provider norm deviation for ingestion AND query responses.
+    raw_vector = np.linspace(-1, 1, settings.embedding_dimensions, dtype=np.float64)
+    raw_vector *= 1.0004726255 / math.hypot(*raw_vector)
+    assert math.isclose(math.hypot(*raw_vector), 1.0004726255, rel_tol=1e-14)
+    if embedding_provider == "bedrock":
+        provider_server["embedding_vector"] = raw_vector.tolist()
+    else:
+        embedding_server["vector"] = raw_vector.tolist()
     content = "Eligible delivered orders can receive a refund up to the remaining charged amount."
     vector = build_embedder(settings).embed(content)
+    assert vector.dtype == np.float32
+    assert math.isclose(math.hypot(*vector), 1, rel_tol=0, abs_tol=1e-6)
     with database.pool.connection() as connection:
         register_vector(connection)
         connection.execute(
             "UPDATE knowledge.support_chunks SET embedding_model=%s, embedding_dimensions=%s, embedding=%s",
             (settings.embedding_model, settings.embedding_dimensions, vector),
         )
+        stored = connection.execute(
+            "SELECT embedding, vector_norm(embedding) AS norm FROM knowledge.support_chunks"
+        ).fetchone()
+        assert abs(stored[1] - 1) <= 1e-6
+        np.testing.assert_array_equal(stored[0], vector)
         other_model, other_dimensions = (
             (EMBEDDING_MODEL, 3072)
             if embedding_provider == "bedrock"
@@ -278,6 +300,16 @@ def test_provider_agent_workflows(
     assert retrieval["embedding_model"] == settings.embedding_model
     assert retrieval["embedding_dimensions"] == settings.embedding_dimensions
     assert len([event for event in events if event["event"] == "tool_finished"]) == 5
+    requests = (
+        provider_server["embedding_requests"]
+        if embedding_provider == "bedrock"
+        else embedding_server["requests"]
+    )
+    input_key = "inputText" if embedding_provider == "bedrock" else "input"
+    expected_inputs = [content, "refund policy"]
+    if embedding_provider == "openai":
+        expected_inputs = [[text] for text in expected_inputs]
+    assert [request[input_key] for request in requests] == expected_inputs
     for secret in [
         "chat-test-key",
         "embedding-test-key",

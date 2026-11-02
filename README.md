@@ -219,9 +219,28 @@ API's input limit. Invalid or oversized inputs are reported instead of silently
 shortened. Titan V2 accepts up to 8,192 tokens or 50,000 characters; this
 implementation selects its full 1,024-dimensional float output and requests
 `normalize=true`. See the [Titan V2 contract](https://docs.aws.amazon.com/bedrock/latest/userguide/titan-embedding-models.html).
-Both providers return unit-length vectors; the application validates their
-dimensions, finiteness and normalization and stores/binds float32 values.
-See the [OpenAI embedding guide](https://developers.openai.com/api/docs/guides/embeddings).
+Provider embeddings are validated and **locally normalized** by the same
+`validated_vector` processor for document ingestion and query search, for both
+OpenAI and Titan. A provider norm such as `1.0004726255` is accepted and normalized;
+the agent does not require the provider's output to already have unit length.
+Inputs must be one-dimensional real numeric vectors of the selected size, with
+only finite values. Norms are calculated in float64 using a scaled Euclidean
+norm calculation (`math.hypot`) to avoid intermediate overflow/underflow. Zero,
+non-finite and subnormal float64 norms (below `np.finfo(np.float64).tiny`, about
+`2.225e-308`) are rejected as unsafe. Accepted vectors are divided by their norm
+before conversion to float32. The resulting vector must be finite and have
+unit norm within **absolute tolerance `1e-6`, with zero relative tolerance**,
+measured in float64. Repeated processing remains stable within this tolerance.
+
+Diagnostics distinguish `embedding_dimensions`, `embedding_numeric`,
+`embedding_non_finite`, `embedding_norm`, and `embedding_normalization`.
+They report expected/actual shape and measured norm when available, without
+including vector contents, input text or credentials. QA Factory and Interceptor
+should reuse the agent's embedder without compensating transformations.
+Stored-document model/dimension, norm and content-digest checks remain enforced;
+search never silently normalizes or rewrites existing database contents. The
+existing stored-norm check retains its `np.isclose` tolerance (`atol=1e-4`,
+`rtol=1e-5`), separate from the stricter newly produced vector postcondition.
 
 Existing ingestion can reuse `build_embedder(Settings()).embed(content)` from
 `support_agent.retrieval` and `digest(content.encode("utf-8"))` from
@@ -410,5 +429,9 @@ API calls. Five-tool workflows cover direct Claude, Bedrock Converse, and mixed
 chat/embedding providers with real pgvector retrieval. A table containing both
 OpenAI and Titan vectors verifies model/dimension filtering; evidence checks
 verify provider metadata and credential exclusion. Tests also invoke the CLI.
+Controlled responses with norm `1.0004726255` exercise document ingestion,
+storage and retrieval for both embedding providers. Numerical regression tests
+cover repeated normalization, invalid shapes/values and unsafe norms; stored
+non-unit vectors are still rejected without modification.
 They do not measure live provider
 availability, embedding quality, or chat-model policy adherence.
