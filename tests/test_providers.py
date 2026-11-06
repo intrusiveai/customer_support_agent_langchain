@@ -38,6 +38,7 @@ def provider_server(aws_credentials):
         "chat_requests": [],
         "embedding_status": 200,
         "embedding_vector": [1.0] + [0.0] * 1023,
+        "completion_allowance": 2048,
     }
     calls = [
         ("search_support_docs", {"query": "refund policy"}),
@@ -103,7 +104,7 @@ def provider_server(aws_credentials):
                     tool["toolSpec"]["inputSchema"]["json"]
                     for tool in request["toolConfig"]["tools"]
                 ]
-                assert request["inferenceConfig"]["maxTokens"] == 2048
+                assert request["inferenceConfig"]["maxTokens"] == state["completion_allowance"]
             else:
                 assert path == "/v1/chat/completions"
                 provider = "openai"
@@ -115,12 +116,18 @@ def provider_server(aws_credentials):
                 ]
                 tool_schemas = [tool["function"]["parameters"] for tool in request["tools"]]
             assert len(tool_schemas) == 5
+            if provider != "bedrock":
+                token_key = "max_tokens" if provider == "anthropic" else "max_completion_tokens"
+                assert request[token_key] == state["completion_allowance"]
             assert all("runtime" not in schema["properties"] for schema in tool_schemas)
             assert all(result["outcome"] in {"ok", "committed"} for result in results)
-            calling = len(results) < len(calls)
+            selected_calls = state.get("tool_calls", calls)
+            calling = len(results) < len(selected_calls)
             if calling:
-                name, arguments = calls[len(results)]
+                name, arguments = selected_calls[len(results)]
                 call_id = f"provider-call-{len(results)}"
+            elif "final_response" in state:
+                answer = state["final_response"]["text"]
             else:
                 passage = results[0]["data"]["passages"][0]
                 assert abs(passage["distance"]) < 1e-6
@@ -178,6 +185,40 @@ def provider_server(aws_credentials):
                     ],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
                 }
+            if not calling and "final_response" in state:
+                final = state["final_response"]
+                if provider == "anthropic":
+                    body["stop_reason"] = final["reason"]
+                    body["usage"] = {
+                        "input_tokens": 17,
+                        "output_tokens": state["completion_allowance"],
+                        "output_tokens_details": {"thinking_tokens": final["reasoning_tokens"]},
+                    }
+                elif provider == "bedrock":
+                    body["stopReason"] = final["reason"]
+                    body["usage"] = {
+                        "inputTokens": 17,
+                        "outputTokens": state["completion_allowance"],
+                        "totalTokens": 17 + state["completion_allowance"],
+                    }
+                    if final["reasoning_tokens"] is not None:
+                        body["additionalModelResponseFields"] = {
+                            "usage": {
+                                "output_tokens_details": {
+                                    "thinking_tokens": final["reasoning_tokens"]
+                                }
+                            }
+                        }
+                else:
+                    body["choices"][0]["finish_reason"] = final["reason"]
+                    body["usage"] = {
+                        "prompt_tokens": 17,
+                        "completion_tokens": state["completion_allowance"],
+                        "total_tokens": 17 + state["completion_allowance"],
+                        "completion_tokens_details": {
+                            "reasoning_tokens": final["reasoning_tokens"]
+                        },
+                    }
             self.respond(body)
 
         def respond(self, body, status=200):
@@ -419,3 +460,97 @@ def test_embedding_provider_validation():
             model_name="test",
             embedding_provider="unsupported",
         )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "bedrock"])
+@pytest.mark.parametrize(
+    "scenario",
+    ["empty_limit", "partial_limit", "empty_stop", "complete_at_limit", "refund_then_limit"],
+)
+def test_model_completion_outcomes(database, db_settings, provider_server, provider, scenario):
+    exhausted = scenario in {"empty_limit", "partial_limit", "refund_then_limit"}
+    text = "" if scenario in {"empty_limit", "empty_stop"} else "Refund details."
+    reason = (
+        ("length" if provider == "openai" else "max_tokens")
+        if exhausted
+        else ("stop" if provider == "openai" else "end_turn")
+    )
+    allowance = 2048 if scenario == "empty_limit" else 8193
+    reasoning = allowance if scenario == "empty_limit" else (allowance - 10 if exhausted else None)
+    provider_server.update(
+        completion_allowance=allowance,
+        tool_calls=[
+            ("issue_refund", {"order_id": "alice-order", "amount": "1.00", "reason": "test"})
+        ]
+        if scenario == "refund_then_limit"
+        else [],
+        final_response={"text": text, "reason": reason, "reasoning_tokens": reasoning},
+    )
+    settings = db_settings.model_copy(
+        update={
+            "model_provider": provider,
+            "model_name": "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+            if provider == "bedrock"
+            else ("gpt-5-mini" if provider == "openai" else "configured-claude-model"),
+            "model_api_key": SecretStr("chat-test-key"),
+            "model_base_url": provider_server["url"] + ("/v1" if provider == "openai" else ""),
+            "model_max_tokens": allowance,
+            "aws_region": "us-east-1",
+            "aws_profile": None,
+        }
+    )
+    code = "model_output_limit" if exhausted else "model_empty_response"
+    with SupportApplication(settings) as app:
+        session = app.start_session("alice")
+        if scenario == "complete_at_limit":
+            response = invoke_support(app, session, "Help me.")
+            assert set(response) == {"session_id", "interaction_id", "answer"}
+            assert response["answer"] == text
+        else:
+            with pytest.raises(Rejected) as error:
+                invoke_support(app, session, "Refund one dollar if requested.")
+            assert error.value.code == code
+            assert "Inspect retained tool outcomes" in error.value.message
+            with pytest.raises(Rejected) as blocked:
+                invoke_support(app, session, "Try again.")
+            assert blocked.value.code == "session_requires_review"
+    expected_calls = 2 if scenario == "refund_then_limit" else 1
+    assert len(provider_server["chat_requests"]) == expected_calls
+    events = [json.loads(path.read_text()) for path in settings.evidence_path.glob("*.json")]
+    ending = next(e for e in events if e["event"] in {"interaction_failed", "interaction_finished"})
+    assert ending["session_id"] == session.session_id
+    assert ending["interaction_id"]
+    if scenario != "complete_at_limit":
+        assert ending["event"] == "interaction_failed"
+        assert ending["error_code"] == code
+        assert ending["message"] == error.value.message
+        assert not any(e["event"] == "interaction_finished" for e in events)
+    last = ending["messages"][-1]
+    assert last["content"] == text
+    metadata = last["model_metadata"]
+    assert metadata["provider"] == provider and metadata["model"] == settings.model_name
+    assert metadata["completion_allowance"] == allowance
+    assert metadata["input_tokens"] == 17 and metadata["output_tokens"] == allowance
+    assert metadata["reasoning_tokens"] == reasoning
+    reason_key = {"openai": "finish_reason", "anthropic": "stop_reason", "bedrock": "stopReason"}[
+        provider
+    ]
+    assert metadata[reason_key] == reason
+    assert len([e for e in events if e["event"] == "model_response"]) == expected_calls
+    if scenario == "refund_then_limit":
+        tool = next(m for m in ending["messages"] if m["type"] == "tool")
+        assert json.loads(tool["content"])["outcome"] == "committed"
+        assert any(
+            e["event"] == "tool_finished" and e["result"]["outcome"] == "committed" for e in events
+        )
+        with database.transaction(read_only=True) as tx:
+            assert tx.execute("SELECT count(*) AS n FROM support.refunds").fetchone()["n"] == 1
+            assert (
+                tx.execute(
+                    "SELECT refunded_minor FROM support.orders WHERE order_id='alice-order'"
+                ).fetchone()["refunded_minor"]
+                == 100
+            )
+    for secret in ["chat-test-key", "provider-test-secret", "provider-test-token"]:
+        assert secret not in json.dumps(events)

@@ -85,6 +85,24 @@ format (OpenAI typically ends in `/v1`; Anthropic uses its API root; Bedrock use
 a regional runtime endpoint). Remove overrides when switching back to provider
 defaults. No provider, endpoint or credential is selected by tool arguments.
 
+`SUPPORT_MODEL_MAX_TOKENS` (default `2048`) is a **per-request completion
+allowance**. It is passed unchanged through the integration as OpenAI Chat
+Completions `max_completion_tokens` (or Responses `max_output_tokens`), Anthropic
+`max_tokens`, or Bedrock Converse `inferenceConfig.maxTokens`. It is separate
+from `SUPPORT_AGENT_MODEL_CALL_LIMIT` (requests per interaction), tool/graph
+limits, and any overall token or spending budget imposed by the caller.
+It does not impose an aggregate token budget across requests.
+
+Reasoning models can spend the entire completion allowance on reasoning before
+producing visible text. In the reported GPT-5 mini campaign, all 2,048 completion
+tokens were reasoning tokens and the answer was empty. Callers can choose a
+larger allowance, for example `SUPPORT_MODEL_MAX_TOKENS=8192`, within the selected
+model's limits and their cost budget. See OpenAI's guidance on
+[allocating space for reasoning](https://developers.openai.com/api/docs/guides/reasoning#allocating-space-for-reasoning).
+A larger allowance reduces this failure mode; it does not replace checking
+termination metadata. The agent never automatically increases the allowance or
+replays an interaction after exhaustion.
+
 All limits, pool settings and paths are listed in [.env.example](.env.example).
 `uv.lock` pins the complete resolved dependency graph; use `--locked` for
 repeatable installs. No database, model service, ingestion pipeline or summary
@@ -111,6 +129,24 @@ serialized; sessions can run independently. The API is synchronous; an async
 host should run `invoke_support` in a worker thread. Histories do not resume
 across process restarts. A failed interaction blocks that session so a host
 does not silently replay partially completed work.
+
+Each model response is checked before further tool execution and before
+`interaction_finished` is recorded. OpenAI `finish_reason=length`, Anthropic
+`stop_reason=max_tokens`, and Bedrock `stopReason=max_tokens` raise
+`Rejected(code="model_output_limit")`, even when partial answer text exists.
+OpenAI Responses `status=incomplete` with reason `max_output_tokens` receives
+the same error; other explicit Responses incomplete reasons receive
+`model_incomplete_response`. Token usage equalling the allowance alone is not
+treated as exhaustion. A blank final answer without an exhaustion indication
+raises `model_empty_response`; empty intermediate messages with valid tool calls
+remain supported.
+
+These failures retain diagnostics and partial text in `interaction_failed`,
+and subsequent calls on that session raise `session_requires_review`. Review
+the retained tool outcomes and refund ledger before starting replacement work.
+A failed answer does not roll back an earlier committed refund and must not
+be interpreted as a failed refund. Successful invocations retain the same
+`{session_id, interaction_id, answer}` result format.
 
 The modules separate agent construction, session handling, bounded tools,
 account operations, database transactions/schema checks, document retrieval,
@@ -396,9 +432,19 @@ event, mode 0600 in a 0700 directory. Join records by `session_id`,
 retain original tool arguments, constructed vulnerable SQL and bound identity,
 raw bounded projections, supplementary records, database diagnostics, retrieval
 identity/scores/source references/text, refund selection/locked owner/balances
-and outcomes, and bounded web results. Interaction events retain conversation
-messages, not summaries. Provider/connection credentials, authentication headers
-and arbitrary provider exception details are not recorded.
+and outcomes, and bounded web results. Interaction events retain user messages,
+visible assistant text and tool calls/results, not summaries. Each
+`model_response` event and retained assistant message includes selected
+`model_metadata`: configured provider/model and completion allowance, reported
+model, finish/stop reason, Responses status/incomplete reason, and input/output/
+reasoning-token counts exposed by the integration. Missing fields are `null`
+(unknown), not inferred from configured limits or answer length. Metadata strings
+are limited to 256 characters and counts to nonnegative 64-bit integers; other
+SDK metadata, opaque reasoning blocks, credentials, authentication headers and
+arbitrary provider exception details are not recorded. `interaction_failed`
+records the specific `error_code` and diagnostic message, with available
+conversation messages and any partial answer. Tool events remain independently
+retained under the same interaction ID, including committed refunds.
 
 Customer data, SQL arguments and URLs are sensitive. Choose storage permissions,
 retention and access appropriate to the simulation. Evidence is local plaintext,
@@ -433,5 +479,10 @@ Controlled responses with norm `1.0004726255` exercise document ingestion,
 storage and retrieval for both embedding providers. Numerical regression tests
 cover repeated normalization, invalid shapes/values and unsafe norms; stored
 non-unit vectors are still rejected without modification.
+Completion-limit tests run through `invoke_support` with controlled OpenAI,
+Anthropic and Bedrock HTTP responses, including empty/partial exhausted answers,
+successful answers at the allowance, explicit allowance overrides, and a refund
+committed before exhaustion without replay. Scripted responses cover unknown
+metadata, bounded diagnostics and OpenAI Responses incomplete status handling.
 They do not measure live provider
 availability, embedding quality, or chat-model policy adherence.

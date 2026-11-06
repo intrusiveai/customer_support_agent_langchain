@@ -30,6 +30,7 @@ class RuntimeContext:
     _lock: Lock = field(default_factory=Lock, repr=False)
     _call_numbers: object = field(default_factory=lambda: count(1), repr=False)
     uncertain_refunds: set = field(default_factory=set, repr=False)
+    _model_messages: list = field(default_factory=list, repr=False)
 
     def consume_tool_call(self):
         with self._lock:

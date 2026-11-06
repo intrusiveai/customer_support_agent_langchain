@@ -8,6 +8,7 @@ from .aws import bedrock_client
 from .context import RuntimeContext
 from .retrieval import Retrieval
 from .results import Rejected
+from .model_output import ModelOutputMiddleware
 from .tools import build_tools, retain_tool_evidence
 from .web import Web
 
@@ -82,6 +83,7 @@ def build_agent(settings, database, model=None, embedder=None, web_transport=Non
         context_schema=RuntimeContext,
         middleware=[
             retain_tool_evidence,
+            ModelOutputMiddleware(settings),
             ModelCallLimitMiddleware(
                 run_limit=settings.agent_model_call_limit, exit_behavior="end"
             ),

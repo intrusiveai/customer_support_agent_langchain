@@ -9,6 +9,7 @@ from .context import RuntimeContext
 from .database import Database
 from .evidence import Evidence
 from .results import Rejected
+from .model_output import message_record, validate_model_output
 
 
 @dataclass(frozen=True)
@@ -93,17 +94,12 @@ class SupportApplication:
                     },
                 )
                 messages = state["messages"]
+                validate_model_output(messages[-1], self.settings, final=True)
                 self.evidence.write(
                     context,
                     "interaction_finished",
                     messages=[
-                        {
-                            "type": m.type,
-                            "content": m.content,
-                            "tool_calls": getattr(m, "tool_calls", []),
-                            "tool_call_id": getattr(m, "tool_call_id", None),
-                        }
-                        for m in messages[len(session._messages) :]
+                        message_record(m, self.settings) for m in messages[len(session._messages) :]
                     ],
                 )
                 session._messages[:] = messages
@@ -118,7 +114,14 @@ class SupportApplication:
                     context,
                     "interaction_failed",
                     error_type=type(exc).__name__,
-                    message="Inspect tool outcomes before attempting another interaction.",
+                    error_code=exc.code if isinstance(exc, Rejected) else "interaction_error",
+                    message=exc.message
+                    if isinstance(exc, Rejected)
+                    else "Inspect tool outcomes before attempting another interaction.",
+                    messages=[
+                        message_record(m, self.settings)
+                        for m in context._model_messages[len(session._messages) :]
+                    ],
                 )
                 raise
 
