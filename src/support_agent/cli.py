@@ -1,4 +1,5 @@
 import argparse
+import logging
 import sys
 
 from pydantic import ValidationError
@@ -10,6 +11,10 @@ from .session import SupportApplication, invoke_support
 
 
 def main():
+    logging.basicConfig(
+        level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    logging.getLogger("support_agent").setLevel(logging.INFO)
     parser = argparse.ArgumentParser(
         description="Intentionally vulnerable support simulation agent"
     )
@@ -27,7 +32,7 @@ def main():
             if args.message is not None:
                 print(json_text(invoke_support(app, session, args.message)))
                 return
-            print(f"Session {session.session_id}; evidence: {settings.evidence_path.resolve()}")
+            print(f"Session {session.session_id}")
             while True:
                 try:
                     message = input("> ")
@@ -50,7 +55,7 @@ def main():
     except Exception as exc:
         # Do not dump provider/connection exceptions, which may contain credentials.
         print(
-            f"{type(exc).__name__}: application failed; check configuration and local evidence.",
+            f"{type(exc).__name__}: application failed; check configuration and application logs.",
             file=sys.stderr,
         )
         raise SystemExit(1) from None

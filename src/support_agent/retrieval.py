@@ -236,15 +236,6 @@ class Retrieval:
 
     def search(self, ctx, query):
         settings = self.settings
-        ctx.record(
-            "retrieval_query",
-            query=query,
-            embedding_model=settings.embedding_model,
-            embedding_provider=settings.embedding_provider,
-            embedding_dimensions=settings.embedding_dimensions,
-            normalize_embeddings=True,
-            preprocessing="unmodified text; no splitting or truncation; locally normalized float32",
-        )
         with self.db.transaction(read_only=True) as tx:
             compatibility = tx.execute(
                 """

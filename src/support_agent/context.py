@@ -12,10 +12,6 @@ class ToolContext:
     session_id: str
     interaction_id: str
     invocation_id: str
-    evidence: object = field(repr=False)
-
-    def record(self, event, **payload):
-        return self.evidence.write(self, event, invocation_id=self.invocation_id, **payload)
 
 
 @dataclass(frozen=True)
@@ -23,14 +19,12 @@ class RuntimeContext:
     authenticated_customer_id: str
     session_id: str
     interaction_id: str
-    evidence: object = field(repr=False)
     tool_call_limit: int = 12
     # Mapping is private application state; no model-controlled invocation IDs.
     _calls: dict = field(default_factory=dict, repr=False)
     _lock: Lock = field(default_factory=Lock, repr=False)
     _call_numbers: object = field(default_factory=lambda: count(1), repr=False)
     uncertain_refunds: set = field(default_factory=set, repr=False)
-    _model_messages: list = field(default_factory=list, repr=False)
 
     def consume_tool_call(self):
         with self._lock:
@@ -47,6 +41,5 @@ class RuntimeContext:
                     self.session_id,
                     self.interaction_id,
                     str(uuid4()),
-                    self.evidence,
                 )
             return self._calls[model_call_id]

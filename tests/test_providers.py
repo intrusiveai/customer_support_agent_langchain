@@ -255,8 +255,15 @@ def provider_server(aws_credentials):
     ],
 )
 def test_provider_agent_workflows(
-    database, db_settings, provider_server, embedding_server, chat_provider, embedding_provider
+    database,
+    db_settings,
+    provider_server,
+    embedding_server,
+    chat_provider,
+    embedding_provider,
+    caplog,
 ):
+    caplog.set_level("INFO", logger="support_agent")
     is_bedrock_chat = chat_provider in {"bedrock", "bedrock_converse"}
     settings = db_settings.model_copy(
         update={
@@ -335,12 +342,7 @@ def test_provider_agent_workflows(
         assert session.authenticated_customer_id == "alice"
         followup = invoke_support(app, session, "Summarize what happened.")
         assert followup["answer"] == response["answer"]
-    events = [json.loads(path.read_text()) for path in settings.evidence_path.glob("*.json")]
-    retrieval = next(event for event in events if event["event"] == "retrieval_query")
-    assert retrieval["embedding_provider"] == embedding_provider
-    assert retrieval["embedding_model"] == settings.embedding_model
-    assert retrieval["embedding_dimensions"] == settings.embedding_dimensions
-    assert len([event for event in events if event["event"] == "tool_finished"]) == 5
+    assert len([r for r in caplog.records if r.name == "support_agent.tools"]) == 5
     requests = (
         provider_server["embedding_requests"]
         if embedding_provider == "bedrock"
@@ -357,7 +359,7 @@ def test_provider_agent_workflows(
         "provider-test-secret",
         "provider-test-token",
     ]:
-        assert secret not in json.dumps(events)
+        assert secret not in caplog.text
 
 
 def test_titan_input_and_bounded_retries(settings, provider_server):
@@ -468,7 +470,10 @@ def test_embedding_provider_validation():
     "scenario",
     ["empty_limit", "partial_limit", "empty_stop", "complete_at_limit", "refund_then_limit"],
 )
-def test_model_completion_outcomes(database, db_settings, provider_server, provider, scenario):
+def test_model_completion_outcomes(
+    database, db_settings, provider_server, provider, scenario, caplog
+):
+    caplog.set_level("INFO", logger="support_agent")
     exhausted = scenario in {"empty_limit", "partial_limit", "refund_then_limit"}
     text = "" if scenario in {"empty_limit", "empty_stop"} else "Refund details."
     reason = (
@@ -511,39 +516,34 @@ def test_model_completion_outcomes(database, db_settings, provider_server, provi
             with pytest.raises(Rejected) as error:
                 invoke_support(app, session, "Refund one dollar if requested.")
             assert error.value.code == code
-            assert "Inspect retained tool outcomes" in error.value.message
+            assert "Check application logs and the refund ledger" in error.value.message
             with pytest.raises(Rejected) as blocked:
                 invoke_support(app, session, "Try again.")
             assert blocked.value.code == "session_requires_review"
     expected_calls = 2 if scenario == "refund_then_limit" else 1
     assert len(provider_server["chat_requests"]) == expected_calls
-    events = [json.loads(path.read_text()) for path in settings.evidence_path.glob("*.json")]
-    ending = next(e for e in events if e["event"] in {"interaction_failed", "interaction_finished"})
-    assert ending["session_id"] == session.session_id
-    assert ending["interaction_id"]
+    assert f"session={session.session_id}" in caplog.text
     if scenario != "complete_at_limit":
-        assert ending["event"] == "interaction_failed"
-        assert ending["error_code"] == code
-        assert ending["message"] == error.value.message
-        assert not any(e["event"] == "interaction_finished" for e in events)
-    last = ending["messages"][-1]
-    assert last["content"] == text
-    metadata = last["model_metadata"]
-    assert metadata["provider"] == provider and metadata["model"] == settings.model_name
-    assert metadata["completion_allowance"] == allowance
-    assert metadata["input_tokens"] == 17 and metadata["output_tokens"] == allowance
-    assert metadata["reasoning_tokens"] == reasoning
-    reason_key = {"openai": "finish_reason", "anthropic": "stop_reason", "bedrock": "stopReason"}[
-        provider
-    ]
-    assert metadata[reason_key] == reason
-    assert len([e for e in events if e["event"] == "model_response"]) == expected_calls
+        assert "Interaction failed" in caplog.text and f"code={code}" in caplog.text
+        assert "Interaction completed" not in caplog.text
+        rejected = next(r for r in caplog.records if r.name == "support_agent.model_output")
+        metadata = rejected.args[-1]
+        assert metadata["provider"] == provider and metadata["model"] == settings.model_name
+        assert metadata["completion_allowance"] == allowance
+        assert metadata["input_tokens"] == 17 and metadata["output_tokens"] == allowance
+        assert metadata["reasoning_tokens"] == reasoning
+        reason_key = {
+            "openai": "finish_reason",
+            "anthropic": "stop_reason",
+            "bedrock": "stopReason",
+        }[provider]
+        assert metadata[reason_key] == reason
+    else:
+        assert "Interaction completed" in caplog.text
+        assert "Model response rejected" not in caplog.text
+    assert "Refund details." not in caplog.text
     if scenario == "refund_then_limit":
-        tool = next(m for m in ending["messages"] if m["type"] == "tool")
-        assert json.loads(tool["content"])["outcome"] == "committed"
-        assert any(
-            e["event"] == "tool_finished" and e["result"]["outcome"] == "committed" for e in events
-        )
+        assert "tool=issue_refund outcome=committed" in caplog.text
         with database.transaction(read_only=True) as tx:
             assert tx.execute("SELECT count(*) AS n FROM support.refunds").fetchone()["n"] == 1
             assert (
@@ -553,4 +553,4 @@ def test_model_completion_outcomes(database, db_settings, provider_server, provi
                 == 100
             )
     for secret in ["chat-test-key", "provider-test-secret", "provider-test-token"]:
-        assert secret not in json.dumps(events)
+        assert secret not in caplog.text

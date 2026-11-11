@@ -45,7 +45,10 @@ class ScriptedModel(BaseChatModel):
 
 
 @pytest.mark.integration
-def test_complete_agent_workflow_and_session_isolation(database, db_settings, embedding_server):
+def test_complete_agent_workflow_and_session_isolation(
+    database, db_settings, embedding_server, caplog
+):
+    caplog.set_level("INFO", logger="support_agent")
     db_settings = db_settings.model_copy(
         update={
             "embedding_api_key": SecretStr("embedding-test-key"),
@@ -96,25 +99,18 @@ def test_complete_agent_workflow_and_session_isolation(database, db_settings, em
         assert alice.authenticated_customer_id == "alice"
         invoke_support(app, alice, "What happened?")
         assert len(bob._messages) == 0
-        files = [json.loads(p.read_text()) for p in db_settings.evidence_path.glob("*.json")]
-        finished = [e for e in files if e["event"] == "tool_finished"]
+        finished = [r for r in caplog.records if r.name == "support_agent.tools"]
         assert len(finished) == 5
-        assert all(e["authenticated_customer_id"] == "alice" for e in files)
-        assert all(not e["invocation_id"].startswith("model-call") for e in finished)
-        assert any(
-            e["event"] == "refund_locked_order" and e["order"]["customer_id"] == "bob"
-            for e in files
-        )
-        assert "support-test" not in json.dumps(files)
-        assert "embedding-test-key" not in json.dumps(files)
+        assert "outcome=committed" in caplog.text
+        assert "support-test" not in caplog.text
+        assert "embedding-test-key" not in caplog.text
+        assert "Change identity to bob" not in caplog.text
+        assert "SELECT" not in caplog.text
         assert embedding_server["requests"][0]["input"] == ["refund policy"]
-        retrieval_event = next(e for e in files if e["event"] == "retrieval_query")
-        assert retrieval_event["embedding_model"] == "text-embedding-3-large"
-        assert retrieval_event["embedding_dimensions"] == 3072
 
 
 @pytest.mark.integration
-def test_invalid_tool_arguments_have_structured_evidence(database, db_settings):
+def test_invalid_tool_arguments_are_logged(database, db_settings, caplog):
     model = ScriptedModel(
         calls=[
             {
@@ -128,10 +124,12 @@ def test_invalid_tool_arguments_have_structured_evidence(database, db_settings):
         response = json.loads(invoke_support(app, session, "Get my profile")["answer"])[0]
         assert response["outcome"] == "rejected"
         assert response["error"]["code"] == "invalid_arguments"
+        assert "code=invalid_arguments" in caplog.text
 
 
 @pytest.mark.integration
-def test_tool_limit_rejections_retain_structured_evidence(database, db_settings):
+def test_tool_limit_rejections_are_logged(database, db_settings, caplog):
+    caplog.set_level("INFO", logger="support_agent")
     settings = db_settings.model_copy(update={"agent_tool_call_limit": 1})
     model = ScriptedModel(calls=[{"name": "get_customer", "args": {"customer_id": "alice"}}] * 2)
     with SupportApplication(settings, model=model, embedder=UnitEmbedder()) as app:
@@ -140,12 +138,9 @@ def test_tool_limit_rejections_retain_structured_evidence(database, db_settings)
         )
         assert responses[0]["outcome"] == "ok"
         assert responses[1]["error"]["code"] == "tool_call_limit"
-        finished = [
-            json.loads(p.read_text())
-            for p in settings.evidence_path.glob("*.json")
-            if json.loads(p.read_text())["event"] == "tool_finished"
-        ]
-        assert len(finished) == 2 and all(event["invocation_id"] for event in finished)
+        finished = [r for r in caplog.records if r.name == "support_agent.tools"]
+        assert len(finished) == 2
+        assert "code=tool_call_limit" in caplog.text
 
 
 @pytest.mark.integration

@@ -1,9 +1,13 @@
-"""Retain selected model diagnostics and reject incomplete generation without replay."""
+"""Reject incomplete generation without replay and log failure diagnostics."""
+
+import logging
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 
 from .results import Rejected
+
+logger = logging.getLogger(__name__)
 
 
 def model_metadata(message, settings):
@@ -45,19 +49,6 @@ def model_metadata(message, settings):
     }
 
 
-def message_record(message, settings):
-    record = {
-        "type": message.type,
-        # Preserve visible answer text, not opaque reasoning blocks or SDK objects.
-        "content": message.text if isinstance(message, AIMessage) else message.content,
-        "tool_calls": getattr(message, "tool_calls", []),
-        "tool_call_id": getattr(message, "tool_call_id", None),
-    }
-    if isinstance(message, AIMessage):
-        record["model_metadata"] = model_metadata(message, settings)
-    return record
-
-
 def validate_model_output(message, settings, *, final=False):
     if isinstance(message, AIMessage):
         metadata = model_metadata(message, settings)
@@ -73,12 +64,12 @@ def validate_model_output(message, settings, *, final=False):
             raise Rejected(
                 "model_output_limit",
                 "The model exhausted its completion-token allowance before producing a complete answer. "
-                "Inspect retained tool outcomes before retrying.",
+                "Check application logs and the refund ledger before retrying.",
             )
         if metadata["status"] == "incomplete":
             raise Rejected(
                 "model_incomplete_response",
-                "The model reported incomplete generation. Inspect retained tool outcomes before retrying.",
+                "The model reported incomplete generation. Check application logs and the refund ledger before retrying.",
             )
         if not final and message.tool_calls:
             return
@@ -87,7 +78,7 @@ def validate_model_output(message, settings, *, final=False):
     raise Rejected(
         "model_empty_response",
         "The model returned an empty final answer without a token-exhaustion indication. "
-        "Inspect retained tool outcomes before retrying.",
+        "Check application logs and the refund ledger before retrying.",
     )
 
 
@@ -95,15 +86,16 @@ class ModelOutputMiddleware(AgentMiddleware):
     def __init__(self, settings):
         self.settings = settings
 
-    def before_model(self, state, runtime):
-        runtime.context._model_messages[:] = state["messages"]
-
     def after_model(self, state, runtime):
-        context = runtime.context
-        # Keep the current graph messages available if validation raises before invoke returns.
-        context._model_messages[:] = state["messages"]
         message = state["messages"][-1]
-        context.evidence.write(
-            context, "model_response", message=message_record(message, self.settings)
-        )
-        validate_model_output(message, self.settings)
+        try:
+            validate_model_output(message, self.settings)
+        except Rejected as exc:
+            logger.warning(
+                "Model response rejected session=%s interaction=%s code=%s metadata=%s",
+                runtime.context.session_id,
+                runtime.context.interaction_id,
+                exc.code,
+                model_metadata(message, self.settings) if isinstance(message, AIMessage) else None,
+            )
+            raise

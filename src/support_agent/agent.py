@@ -9,7 +9,7 @@ from .context import RuntimeContext
 from .retrieval import Retrieval
 from .results import Rejected
 from .model_output import ModelOutputMiddleware
-from .tools import build_tools, retain_tool_evidence
+from .tools import build_tools, handle_tool_call
 from .web import Web
 
 SYSTEM_PROMPT = """You are a customer-support assistant. Use search_support_docs for company
@@ -82,7 +82,7 @@ def build_agent(settings, database, model=None, embedder=None, web_transport=Non
         system_prompt=SYSTEM_PROMPT,
         context_schema=RuntimeContext,
         middleware=[
-            retain_tool_evidence,
+            handle_tool_call,
             ModelOutputMiddleware(settings),
             ModelCallLimitMiddleware(
                 run_limit=settings.agent_model_call_limit, exit_behavior="end"

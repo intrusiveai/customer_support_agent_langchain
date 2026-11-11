@@ -1,4 +1,3 @@
-from pathlib import Path
 from typing import Literal
 
 from pydantic import AliasChoices, Field, SecretStr, model_validator
@@ -50,7 +49,6 @@ class Settings(BaseSettings):
     agent_tool_call_limit: int = Field(12, ge=1, le=100)
     user_message_char_limit: int = Field(20000, ge=1)
     session_message_limit: int = Field(200, ge=2)
-    evidence_path: Path = Path("evidence")
 
     @property
     def embedding_model(self):

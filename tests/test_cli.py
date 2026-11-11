@@ -83,7 +83,6 @@ def test_cli_uses_configured_chat_integration_and_real_account_tool(
             "SUPPORT_MODEL_API_KEY": "local-test-only",
             "SUPPORT_MODEL_KWARGS": "{}",
             "SUPPORT_MODEL_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
-            "SUPPORT_EVIDENCE_PATH": str(tmp_path / "cli-evidence"),
         }
         completed = subprocess.run(
             [
@@ -96,6 +95,7 @@ def test_cli_uses_configured_chat_integration_and_real_account_tool(
                 "Check alice-order",
             ],
             env=environment,
+            cwd=tmp_path,
             text=True,
             capture_output=True,
             timeout=30,
@@ -103,8 +103,10 @@ def test_cli_uses_configured_chat_integration_and_real_account_tool(
         )
         assert json.loads(completed.stdout)["answer"] == "Order alice-order is delivered."
         assert len(requests) == 2
-        evidence = "".join(p.read_text() for p in (tmp_path / "cli-evidence").glob("*.json"))
-        assert "local-test-only" not in evidence and "support-test" not in evidence
+        assert "Interaction completed" in completed.stderr
+        assert "tool=get_order outcome=ok" in completed.stderr
+        assert "local-test-only" not in completed.stderr and "support-test" not in completed.stderr
+        assert list(tmp_path.iterdir()) == []
     finally:
         server.shutdown()
         server.server_close()

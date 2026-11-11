@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import Annotated, Any
 
 import psycopg
@@ -12,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 from .context import RuntimeContext
 from .database import diagnostics
 from .results import Rejected, json_text, result
+
+logger = logging.getLogger(__name__)
 
 
 class ToolArgs(BaseModel):
@@ -89,17 +92,11 @@ def build_tools(accounts, retrieval, web, settings):
 
 
 @wrap_tool_call
-def retain_tool_evidence(request, handler):
+def handle_tool_call(request, handler):
     context = request.runtime.context
     ctx = context.call(request.tool_call["id"])
-    ctx.record(
-        "tool_started",
-        tool=request.tool_call["name"],
-        arguments=request.tool_call["args"],
-        model_tool_call_id=request.tool_call["id"],
-    )
     try:
-        # Enforce here so denied calls receive the same trusted IDs and evidence as executed calls.
+        # Enforce here so denied calls receive the same structured errors as executed calls.
         context.consume_tool_call()
         message = handler(request)
     except ValidationError:
@@ -111,9 +108,17 @@ def retain_tool_evidence(request, handler):
     except Rejected as exc:
         response = result("rejected", code=exc.code, message=exc.message)
     except (psycopg.Error, PoolTimeout) as exc:
-        ctx.record("database_error", diagnostics=diagnostics(exc))
+        logger.error(
+            "Database operation failed session=%s interaction=%s invocation=%s diagnostics=%s",
+            ctx.session_id,
+            ctx.interaction_id,
+            ctx.invocation_id,
+            diagnostics(exc),
+        )
         response = result(
-            "error", code="database_error", message="Database operation failed; see local evidence."
+            "error",
+            code="database_error",
+            message="Database operation failed; check application logs.",
         )
     else:
         try:
@@ -126,16 +131,21 @@ def retain_tool_evidence(request, handler):
             )
     # Normalize UUIDs, timestamps and integer money without altering projected strings.
     encoded = json_text(response)
-    try:
-        ctx.record("tool_finished", tool=request.tool_call["name"], result=json.loads(encoded))
-    except OSError:
-        # A committed refund must remain committed in the caller's view even if disk fails.
-        if response["outcome"] != "committed":
-            raise
-        response["evidence_error"] = (
-            "Could not persist final event; resolve using the committed ledger result."
-        )
-        encoded = json_text(response)
+    logger.log(
+        logging.INFO
+        if response["outcome"] in {"ok", "committed", "no_matches"}
+        else logging.WARNING,
+        "Tool completed session=%s interaction=%s invocation=%s tool=%s outcome=%s code=%s refund_id=%s",
+        ctx.session_id,
+        ctx.interaction_id,
+        ctx.invocation_id,
+        request.tool_call["name"],
+        response["outcome"],
+        (response.get("error") or {}).get("code"),
+        (response.get("data") or {}).get("refund_id")
+        if response["outcome"] == "committed"
+        else None,
+    )
     return ToolMessage(
         content=encoded, tool_call_id=request.tool_call["id"], name=request.tool_call["name"]
     )

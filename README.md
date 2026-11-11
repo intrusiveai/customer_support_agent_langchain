@@ -131,7 +131,7 @@ across process restarts. A failed interaction blocks that session so a host
 does not silently replay partially completed work.
 
 Each model response is checked before further tool execution and before
-`interaction_finished` is recorded. OpenAI `finish_reason=length`, Anthropic
+reporting interaction success. OpenAI `finish_reason=length`, Anthropic
 `stop_reason=max_tokens`, and Bedrock `stopReason=max_tokens` raise
 `Rejected(code="model_output_limit")`, even when partial answer text exists.
 OpenAI Responses `status=incomplete` with reason `max_output_tokens` receives
@@ -141,16 +141,16 @@ treated as exhaustion. A blank final answer without an exhaustion indication
 raises `model_empty_response`; empty intermediate messages with valid tool calls
 remain supported.
 
-These failures retain diagnostics and partial text in `interaction_failed`,
-and subsequent calls on that session raise `session_requires_review`. Review
-the retained tool outcomes and refund ledger before starting replacement work.
+These failures raise `Rejected` and log their error code and model diagnostics.
+Subsequent calls on that session raise `session_requires_review`. Review
+application logs and the refund ledger before starting replacement work.
 A failed answer does not roll back an earlier committed refund and must not
 be interpreted as a failed refund. Successful invocations retain the same
 `{session_id, interaction_id, answer}` result format.
 
 The modules separate agent construction, session handling, bounded tools,
 account operations, database transactions/schema checks, document retrieval,
-web retrieval and evidence. There is one agent and exactly five tools:
+web retrieval and model-output validation. There is one agent and exactly five tools:
 
 | Tool | Behavior and dependency |
 | --- | --- |
@@ -313,7 +313,7 @@ or rejected credentials/access, `embedding_input` for invalid input,
 `embedding_rate_limit` for quota/rate limits, `embedding_timeout` for timeouts,
 `embedding_service` for transport/provider failures, and `embedding_response`
 or `embedding_incompatible` for malformed or incompatible output. Provider
-exception bodies and API keys are not retained in interaction evidence.
+exception bodies and API keys are not written to application logs.
 
 ## Deliberate SQL injection and immutable identity
 
@@ -363,7 +363,7 @@ application. Model tool-call IDs are mapped to trusted UUIDs within an
 interaction, and are not used directly as ledger invocation IDs.
 
 Existing permissions and row-level policies still apply and may prevent an
-exploit. Startup reports missing grants and enabled RLS; query failures retain
+exploit. Startup reports missing grants and enabled RLS; query failures log
 SQLSTATE/constraint/table diagnostics. The application never changes database
 security controls. Read tools use read-only transactions; statement timeouts
 and row limits remain in force. Use a database role appropriate to your test
@@ -398,16 +398,16 @@ two-place USD string), `reason` (unchanged) and `authenticated_customer_id`.
 New user requests/new model invocations have new IDs; idempotency applies to
 duplicate delivery of the same invocation, not every identical refund request.
 
-Only committed transactions enter `support.refunds`. Evidence distinguishes
-`rejected`, `rolled_back`, `committed` and `uncertain`. If the connection loses
-commit acknowledgement, the tool reports uncertainty and blocks further
-refunds in that session. It does not automatically replay. An operator must
-inspect the ledger using the trusted session/invocation pair and request digest
-from evidence before deciding what happened. Missing a final evidence event is
-not proof of rollback. A process restart does not preserve the in-memory block;
-the host/operator must complete that review before starting replacement work.
+Only committed transactions enter `support.refunds`. Tool results and logs
+identify `rejected`, `rolled_back`, `committed` and `uncertain` outcomes. If the
+connection loses commit acknowledgement, the tool reports uncertainty and blocks
+further refunds in that session. It does not automatically replay. An operator
+must inspect the ledger using the session/invocation IDs from the logs before
+deciding what happened. A missing log entry is not proof of rollback. A process
+restart does not preserve the in-memory block; the host/operator must complete
+that review before starting replacement work.
 
-## Web destinations and evidence
+## Web destinations
 
 The model controls absolute HTTP/HTTPS destinations; **there is no domain
 allowlist or private-address block**. Requests can reach destinations available
@@ -422,34 +422,36 @@ encoding and rejects compressed responses, keeping the byte bound explicit.
 
 Web results include requested/final URLs, redirects, status, content type,
 truncation, readable text and its SHA-256 digest. A separate digest identifies
-the retained response-body prefix. A truncated digest never claims to describe
+the bounded response-body prefix. A truncated digest never claims to describe
 the entire remote resource. Retrieved content cannot change configuration or
 session identity.
 
-`SUPPORT_EVIDENCE_PATH` (default `./evidence`) holds one fsynced JSON file per
-event, mode 0600 in a 0700 directory. Join records by `session_id`,
-`interaction_id`, and trusted `invocation_id`; sort by UTC timestamp. Records
-retain original tool arguments, constructed vulnerable SQL and bound identity,
-raw bounded projections, supplementary records, database diagnostics, retrieval
-identity/scores/source references/text, refund selection/locked owner/balances
-and outcomes, and bounded web results. Interaction events retain user messages,
-visible assistant text and tool calls/results, not summaries. Each
-`model_response` event and retained assistant message includes selected
-`model_metadata`: configured provider/model and completion allowance, reported
-model, finish/stop reason, Responses status/incomplete reason, and input/output/
-reasoning-token counts exposed by the integration. Missing fields are `null`
-(unknown), not inferred from configured limits or answer length. Metadata strings
-are limited to 256 characters and counts to nonnegative 64-bit integers; other
-SDK metadata, opaque reasoning blocks, credentials, authentication headers and
-arbitrary provider exception details are not recorded. `interaction_failed`
-records the specific `error_code` and diagnostic message, with available
-conversation messages and any partial answer. Tool events remain independently
-retained under the same interaction ID, including committed refunds.
+## Logging
 
-Customer data, SQL arguments and URLs are sensitive. Choose storage permissions,
-retention and access appropriate to the simulation. Evidence is local plaintext,
-not tamper-proof audit storage. Failure to write initial evidence stops the tool;
-a failure after a refund commits must not reclassify that refund as rolled back.
+The application uses Python's standard `logging` module under the `support_agent`
+logger namespace. The CLI writes INFO-level interaction/tool status and warnings
+or errors to stderr; successful JSON answers remain on stdout. Library callers
+configure their own handlers and levels, for example:
+
+```python
+import logging
+
+logging.basicConfig(level=logging.INFO)
+```
+
+To save CLI logs, use ordinary shell redirection (`2>support-agent.log`) or
+configure a standard `logging.FileHandler` in the host application. The agent
+creates no evidence directory or log files and applies no special file
+permissions. File permissions and rotation follow the host's normal logging
+configuration and operating-system defaults.
+
+Logs include session/interaction IDs, tool invocation IDs, outcome/error codes,
+and committed refund IDs. Model failures also log provider/model, configured
+completion allowance, stop reason and available token counts; missing values
+remain unknown. Exceptions still propagate through the existing error handling,
+and failed sessions remain blocked for review. Logs omit conversation text,
+tool arguments/results, SQL, customer records, retrieved content, credentials
+and arbitrary SDK metadata. PostgreSQL remains the authoritative refund ledger.
 
 ## Verify
 
@@ -473,8 +475,9 @@ HTTP responses. Tests exercise the real OpenAI, Anthropic and AWS SDK integratio
 against local HTTP protocol fixtures, with deterministic responses and no paid
 API calls. Five-tool workflows cover direct Claude, Bedrock Converse, and mixed
 chat/embedding providers with real pgvector retrieval. A table containing both
-OpenAI and Titan vectors verifies model/dimension filtering; evidence checks
-verify provider metadata and credential exclusion. Tests also invoke the CLI.
+OpenAI and Titan vectors verifies model/dimension filtering. Tests capture
+standard logs to check failure diagnostics and credential exclusion, and invoke
+the CLI to verify stderr logging without creating application files.
 Controlled responses with norm `1.0004726255` exercise document ingestion,
 storage and retrieval for both embedding providers. Numerical regression tests
 cover repeated normalization, invalid shapes/values and unsafe norms; stored

@@ -14,7 +14,6 @@ from psycopg.conninfo import conninfo_to_dict
 from support_agent.config import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL, Settings
 from support_agent.context import ToolContext
 from support_agent.database import Database
-from support_agent.evidence import Evidence
 from support_agent.results import digest
 
 
@@ -82,13 +81,12 @@ def embedding_server():
 
 
 @pytest.fixture
-def settings(tmp_path):
+def settings():
     return Settings(
         _env_file=None,
         database_url="postgresql://unused/unused",
         model_name="scripted-test",
         embedding_api_key=None,
-        evidence_path=tmp_path / "evidence",
         result_limit=2,
     )
 
@@ -165,7 +163,5 @@ def database(db_settings):
 
 
 @pytest.fixture
-def ctx(settings):
-    return ToolContext(
-        "alice", str(uuid4()), str(uuid4()), str(uuid4()), Evidence(settings.evidence_path)
-    )
+def ctx():
+    return ToolContext("alice", str(uuid4()), str(uuid4()), str(uuid4()))

@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass, field
 from threading import Lock
 from uuid import uuid4
@@ -7,9 +8,10 @@ from langchain_core.messages import HumanMessage
 from .agent import build_agent
 from .context import RuntimeContext
 from .database import Database
-from .evidence import Evidence
 from .results import Rejected
-from .model_output import message_record, validate_model_output
+from .model_output import validate_model_output
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -25,7 +27,6 @@ class Session:
 class SupportApplication:
     def __init__(self, settings, *, model=None, embedder=None, web_transport=None):
         self.settings = settings
-        self.evidence = Evidence(settings.evidence_path)
         self.database = Database(settings)
         self.notices = self.database.start()
         self._sessions = {}
@@ -71,7 +72,7 @@ class SupportApplication:
             if session._failed_interactions:
                 raise Rejected(
                     "session_requires_review",
-                    "A prior interaction failed. Inspect its evidence before starting a new session; do not replay refunds.",
+                    "A prior interaction failed. Check application logs and the refund ledger before starting a new session; do not replay refunds.",
                 )
             if len(session._messages) >= self.settings.session_message_limit:
                 raise Rejected("session_limit", "Conversation limit reached; start a new session.")
@@ -79,11 +80,14 @@ class SupportApplication:
                 session.authenticated_customer_id,
                 session.session_id,
                 str(uuid4()),
-                self.evidence,
                 tool_call_limit=self.settings.agent_tool_call_limit,
                 uncertain_refunds=session._uncertain_refunds,
             )
-            self.evidence.write(context, "interaction_started", user_message=message)
+            logger.info(
+                "Interaction started session=%s interaction=%s",
+                session.session_id,
+                context.interaction_id,
+            )
             try:
                 state = self.agent.invoke(
                     {"messages": [*session._messages, HumanMessage(content=message)]},
@@ -95,12 +99,10 @@ class SupportApplication:
                 )
                 messages = state["messages"]
                 validate_model_output(messages[-1], self.settings, final=True)
-                self.evidence.write(
-                    context,
-                    "interaction_finished",
-                    messages=[
-                        message_record(m, self.settings) for m in messages[len(session._messages) :]
-                    ],
+                logger.info(
+                    "Interaction completed session=%s interaction=%s",
+                    session.session_id,
+                    context.interaction_id,
                 )
                 session._messages[:] = messages
                 return {
@@ -110,18 +112,15 @@ class SupportApplication:
                 }
             except Exception as exc:
                 session._failed_interactions.add(context.interaction_id)
-                self.evidence.write(
-                    context,
-                    "interaction_failed",
-                    error_type=type(exc).__name__,
-                    error_code=exc.code if isinstance(exc, Rejected) else "interaction_error",
-                    message=exc.message
+                logger.error(
+                    "Interaction failed session=%s interaction=%s code=%s type=%s: %s",
+                    session.session_id,
+                    context.interaction_id,
+                    exc.code if isinstance(exc, Rejected) else "interaction_error",
+                    type(exc).__name__,
+                    exc.message
                     if isinstance(exc, Rejected)
-                    else "Inspect tool outcomes before attempting another interaction.",
-                    messages=[
-                        message_record(m, self.settings)
-                        for m in context._model_messages[len(session._messages) :]
-                    ],
+                    else "Check configuration, application logs and the refund ledger before retrying.",
                 )
                 raise
 

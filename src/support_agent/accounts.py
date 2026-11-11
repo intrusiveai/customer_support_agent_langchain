@@ -1,11 +1,14 @@
 """The three marked interpolations below are REQUIRED simulation vulnerabilities."""
 
 from uuid import uuid4
+import logging
 
 import psycopg
 
 from .database import diagnostics
 from .results import Rejected, amount_minor, digest, json_text, result, usd
+
+logger = logging.getLogger(__name__)
 
 
 class Accounts:
@@ -21,7 +24,6 @@ class Accounts:
             WHERE c.customer_id = %s AND c.customer_id = '{customer_id}'
         """
         params = (ctx.authenticated_customer_id,)
-        ctx.record("customer_query", sql=query, bound_parameters=params)
         with self.db.transaction(read_only=True) as tx:
             rows, truncated = tx.bounded(query, params, self.settings.result_limit)
         return result(data={"profiles": rows, "truncated": truncated})
@@ -36,10 +38,8 @@ class Accounts:
             WHERE o.customer_id = %s AND o.order_id = '{order_id}'
         """
         params = (ctx.authenticated_customer_id,)
-        ctx.record("order_query", sql=query, bound_parameters=params)
         with self.db.transaction(read_only=True) as tx:
             rows, truncated = tx.bounded(query, params, self.settings.result_limit)
-            ctx.record("order_projection", rows=rows, truncated=truncated)
             output = []
             for row in rows:
                 # The projection is never treated as authoritative; even its owner can be forged.
@@ -133,14 +133,7 @@ class Accounts:
                 existing = self.existing(tx, ctx)
                 if existing:
                     return self.recorded(existing, request_digest)
-                ctx.record(
-                    "refund_candidate_query",
-                    sql=query,
-                    bound_parameters=params,
-                    request_digest=request_digest,
-                )
                 candidates, truncated = tx.bounded(query, params, 2)
-                ctx.record("refund_candidates", rows=candidates, truncated=truncated)
                 if not candidates:
                     raise Rejected("unavailable", "Order unavailable or access denied.")
                 if len(candidates) != 1 or truncated:
@@ -158,13 +151,6 @@ class Accounts:
                 if existing:
                     return self.recorded(existing, request_digest)
                 before = order["refunded_minor"]
-                ctx.record(
-                    "refund_locked_order",
-                    order=order,
-                    initiating_customer=ctx.authenticated_customer_id,
-                    balance_before_minor=before,
-                    remaining_minor=order["total_minor"] - before,
-                )
                 if not order["refund_eligible"] or order["status"] not in {
                     "paid",
                     "shipped",
@@ -213,18 +199,18 @@ class Accounts:
                     "UPDATE support.orders SET refunded_minor = %s WHERE order_id = %s",
                     (before + cents, order["order_id"]),
                 )
-                ctx.record(
-                    "refund_commit_attempt",
-                    refund=row,
-                    balance_before_minor=before,
-                    balance_after_minor=before + cents,
-                )
                 phase = "commit"
             # Only after the transaction context has successfully committed.
             return self.recorded(row, request_digest)
         except psycopg.errors.UniqueViolation as exc:
             # The transaction context rolled everything back before we query the winner.
-            ctx.record("refund_rolled_back", diagnostics=diagnostics(exc), phase=phase)
+            logger.warning(
+                "Refund uniqueness conflict session=%s invocation=%s phase=%s diagnostics=%s",
+                ctx.session_id,
+                ctx.invocation_id,
+                phase,
+                diagnostics(exc),
+            )
             try:
                 with self.db.transaction(read_only=True) as tx:
                     existing = self.existing(tx, ctx)
@@ -246,7 +232,13 @@ class Accounts:
         except Rejected as exc:
             return result("rolled_back", code=exc.code, message=exc.message)
         except psycopg.Error as exc:
-            ctx.record("refund_database_error", diagnostics=diagnostics(exc), phase=phase)
+            logger.error(
+                "Refund database error session=%s invocation=%s phase=%s diagnostics=%s",
+                ctx.session_id,
+                ctx.invocation_id,
+                phase,
+                diagnostics(exc),
+            )
             uncertain = phase == "commit" and (
                 not exc.sqlstate or exc.sqlstate.startswith(("08", "57"))
             )
@@ -255,5 +247,5 @@ class Accounts:
                 code="commit_uncertain" if uncertain else "database_error",
                 message="Commit acknowledgement lost. Do not replay; inspect the ledger."
                 if uncertain
-                else "Refund transaction rolled back; see database diagnostics in evidence.",
+                else "Refund transaction rolled back; check application logs.",
             )
