@@ -429,21 +429,49 @@ session identity.
 ## Logging
 
 The application uses Python's standard `logging` module under the `support_agent`
-logger namespace. The CLI writes INFO-level interaction/tool status and warnings
-or errors to stderr; successful JSON answers remain on stdout. Library callers
-configure their own handlers and levels, for example:
+logger namespace. By default, the CLI writes INFO-level interaction/tool status
+and warnings or errors to stderr; successful JSON answers remain on stdout.
+Configure logging through environment variables or `.env`:
+
+| Parameter | Default | Behavior |
+| --- | --- | --- |
+| `SUPPORT_LOG_FILE` | Unset (stderr) | Append logs to this UTF-8 file instead of stderr. Relative paths resolve from the current working directory. |
+| `SUPPORT_LOG_LEVEL` | `INFO` | Minimum severity: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` (uppercase). Applies with either destination. |
+
+For example, to save warnings, errors and critical messages:
+
+```sh
+SUPPORT_LOG_FILE=./support-agent.log SUPPORT_LOG_LEVEL=WARNING \
+  support-agent --customer-id customer-123 --message "Check order-456."
+```
+
+`DEBUG` includes all agent logging levels; `ERROR` includes errors and critical
+messages. Third-party loggers retain a WARNING baseline and are also filtered
+by the configured threshold. The CLI creates the file if needed, but its parent
+directory must already exist and be writable. An invalid level or a file that
+cannot be opened stops startup. Existing file contents are preserved. Answers
+remain on stdout; startup notices and CLI error messages remain on stderr.
+
+Library callers configure their own handlers and levels. To use the same settings
+in a host application, configure logging before constructing `SupportApplication`:
 
 ```python
 import logging
+from support_agent.config import Settings
 
-logging.basicConfig(level=logging.INFO)
+settings = Settings()
+logging.basicConfig(
+    filename=settings.log_file,
+    encoding="utf-8",
+    level=settings.log_level,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 ```
 
-To save CLI logs, use ordinary shell redirection (`2>support-agent.log`) or
-configure a standard `logging.FileHandler` in the host application. The agent
-creates no evidence directory or log files and applies no special file
-permissions. File permissions and rotation follow the host's normal logging
-configuration and operating-system defaults.
+The CLI applies no special file permissions or automatic log rotation; file
+permissions follow operating-system defaults. Hosts with existing logging
+configuration can attach a standard `logging.FileHandler` to the `support_agent`
+logger instead. Constructing `SupportApplication` does not change host logging.
 
 Logs include session/interaction IDs, tool invocation IDs, outcome/error codes,
 and committed refund IDs. Model failures also log provider/model, configured
@@ -477,7 +505,7 @@ API calls. Five-tool workflows cover direct Claude, Bedrock Converse, and mixed
 chat/embedding providers with real pgvector retrieval. A table containing both
 OpenAI and Titan vectors verifies model/dimension filtering. Tests capture
 standard logs to check failure diagnostics and credential exclusion, and invoke
-the CLI to verify stderr logging without creating application files.
+the CLI to verify default stderr logging, optional file logging and level filtering.
 Controlled responses with norm `1.0004726255` exercise document ingestion,
 storage and retrieval for both embedding providers. Numerical regression tests
 cover repeated normalization, invalid shapes/values and unsafe norms; stored

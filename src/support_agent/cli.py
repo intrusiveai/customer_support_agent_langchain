@@ -11,10 +11,6 @@ from .session import SupportApplication, invoke_support
 
 
 def main():
-    logging.basicConfig(
-        level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
-    logging.getLogger("support_agent").setLevel(logging.INFO)
     parser = argparse.ArgumentParser(
         description="Intentionally vulnerable support simulation agent"
     )
@@ -25,6 +21,23 @@ def main():
     args = parser.parse_args()
     try:
         settings = Settings()
+        try:
+            handler = (
+                logging.FileHandler(settings.log_file, encoding="utf-8")
+                if settings.log_file is not None
+                else logging.StreamHandler()
+            )
+        except OSError:
+            print("Configuration error: cannot open SUPPORT_LOG_FILE for appending.", file=sys.stderr)
+            raise SystemExit(1) from None
+        handler.setLevel(settings.log_level)
+        logging.basicConfig(
+            level=logging.WARNING,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            handlers=[handler],
+            force=True,
+        )
+        logging.getLogger("support_agent").setLevel(settings.log_level)
         with SupportApplication(settings) as app:
             for notice in app.notices:
                 print(notice, file=sys.stderr)

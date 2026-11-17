@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     )
 
     database_url: SecretStr
+    log_file: str | None = Field(default=None, min_length=1)
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     model_provider: str = "openai"
     model_name: str
     model_api_key: SecretStr | None = None
