@@ -93,11 +93,15 @@ def test_cli_rejects_invalid_logging_configuration(tmp_path, environment, error)
 
 @pytest.mark.integration
 @pytest.mark.parametrize("log_level", [None, "INFO", "WARNING"])
+@pytest.mark.parametrize("use_mcp", [False, True])
 def test_cli_uses_configured_chat_integration_and_real_account_tool(
-    database, db_settings, tmp_path, log_level
+    database, db_settings, tmp_path, log_level, use_mcp, mcp_server
 ):
     """Actual CLI -> configured ChatOpenAI -> local protocol server -> real DB tool."""
     requests = []
+    tool_name = f"mcp_{mcp_server['name']}" if use_mcp else "get_order"
+    arguments = {"section": "profile"} if use_mcp else {"order_id": "alice-order"}
+    answer = "You have a new support ticket." if use_mcp else "Order alice-order is delivered."
 
     class ModelServer(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -110,8 +114,11 @@ def test_cli_uses_configured_chat_integration_and_real_account_tool(
             assert self.headers["Authorization"] == "Bearer local-test-only"
             assert request["model"] == "configured-local-model"
             tools = {tool["function"]["name"]: tool["function"] for tool in request["tools"]}
-            assert len(tools) == 5
+            assert len(tools) == (7 if use_mcp else 5)
             assert "runtime" not in tools["get_order"]["parameters"]["properties"]
+            if use_mcp:
+                assert tools[tool_name]["description"] == mcp_server["description"]
+                assert "_support_runtime" not in tools[tool_name]["parameters"]["properties"]
             if any(message["role"] == "tool" for message in request["messages"]):
                 tool_result = json.loads(
                     next(
@@ -120,8 +127,12 @@ def test_cli_uses_configured_chat_integration_and_real_account_tool(
                         if message["role"] == "tool"
                     )
                 )
-                assert tool_result["data"]["orders"][0]["projected"]["status"] == "delivered"
-                message = {"role": "assistant", "content": "Order alice-order is delivered."}
+                if use_mcp:
+                    assert tool_result["data"]["structured_content"]["context"] == "New support ticket"
+                    assert tool_result["data"]["structured_content"]["customer_id"] == "alice"
+                else:
+                    assert tool_result["data"]["orders"][0]["projected"]["status"] == "delivered"
+                message = {"role": "assistant", "content": answer}
                 finish = "stop"
             else:
                 message = {
@@ -132,8 +143,8 @@ def test_cli_uses_configured_chat_integration_and_real_account_tool(
                             "id": "provider-call-1",
                             "type": "function",
                             "function": {
-                                "name": "get_order",
-                                "arguments": json.dumps({"order_id": "alice-order"}),
+                                "name": tool_name,
+                                "arguments": json.dumps(arguments),
                             },
                         }
                     ],
@@ -171,6 +182,12 @@ def test_cli_uses_configured_chat_integration_and_real_account_tool(
         log_file = tmp_path / "agent.log"
         if log_level is not None:
             environment.update(SUPPORT_LOG_FILE=str(log_file), SUPPORT_LOG_LEVEL=log_level)
+        if use_mcp:
+            environment.update(
+                SUPPORT_MCP_URL=mcp_server["url"],
+                SUPPORT_MCP_HEADERS=json.dumps({"Authorization": "Bearer mcp-test-secret"}),
+                SUPPORT_MCP_CUSTOMER_ID_HEADER="X-Test-Customer",
+            )
         completed = subprocess.run(
             [
                 sys.executable,
@@ -188,15 +205,17 @@ def test_cli_uses_configured_chat_integration_and_real_account_tool(
             timeout=30,
             check=True,
         )
-        assert json.loads(completed.stdout)["answer"] == "Order alice-order is delivered."
+        assert json.loads(completed.stdout)["answer"] == answer
         assert len(requests) == 2
+        assert len(mcp_server["calls"]) == (1 if use_mcp else 0)
         logs = log_file.read_text(encoding="utf-8") if log_level else completed.stderr
         assert ("Interaction completed" in logs) == (log_level != "WARNING")
-        assert ("tool=get_order outcome=ok" in logs) == (log_level != "WARNING")
+        assert (f"tool={tool_name} outcome=ok" in logs) == (log_level != "WARNING")
         assert "local-test-only" not in logs and "support-test" not in logs
+        assert "mcp-test-secret" not in logs and "New support ticket" not in logs
         if log_level:
             assert "Interaction completed" not in completed.stderr
-            assert "tool=get_order" not in completed.stderr
+            assert f"tool={tool_name}" not in completed.stderr
             assert list(tmp_path.iterdir()) == [log_file]
         else:
             assert list(tmp_path.iterdir()) == []

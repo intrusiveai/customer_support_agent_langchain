@@ -9,6 +9,7 @@ from .context import RuntimeContext
 from .retrieval import Retrieval
 from .results import Rejected
 from .model_output import ModelOutputMiddleware
+from .mcp import load_mcp_tools
 from .tools import build_tools, handle_tool_call
 from .web import Web
 
@@ -76,6 +77,7 @@ def build_agent(settings, database, model=None, embedder=None, web_transport=Non
         Web(settings, web_transport),
         settings,
     )
+    tools.extend(load_mcp_tools(settings))
     return create_agent(
         model,
         tools=tools,

@@ -165,3 +165,85 @@ def database(db_settings):
 @pytest.fixture
 def ctx():
     return ToolContext("alice", str(uuid4()), str(uuid4()), str(uuid4()))
+
+
+@pytest.fixture
+def mcp_server():
+    """Test-only MCP server exercising discovery and real Streamable HTTP requests."""
+    import asyncio
+    import socket
+    import time
+    from urllib.parse import unquote
+
+    import uvicorn
+    from fastmcp import Context, FastMCP
+    from fastmcp.server.dependencies import get_http_headers
+    from fastmcp.tools.base import ToolResult
+    from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import PlainTextResponse
+
+    state = {
+        "name": "snapshot_" + uuid4().hex[:8],
+        "description": "Fetch current customer context on each lookup. If unavailable, say so.",
+        "calls": [], "requests": [], "delay": 0, "error": False, "status": 200,
+        "log": False, "elicit": False,
+        "customers": {"alice": "New support ticket", "bob": "Pending delivery"},
+    }
+    server = FastMCP("customer-context-test")
+
+    class Authenticate(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            state["requests"].append(dict(request.headers))
+            if request.headers.get("authorization") != "Bearer mcp-test-secret":
+                return PlainTextResponse("Unauthorized", status_code=401)
+            if state["status"] != 200:
+                return PlainTextResponse("private server diagnostic", status_code=state["status"])
+            return await call_next(request)
+
+    @server.tool(name=state["name"], description=state["description"])
+    async def snapshot(section: str, ctx: Context):
+        headers = get_http_headers(include_all=True)
+        customer_id = unquote(headers["x-test-customer"])
+        state["calls"].append({"customer_id": customer_id, "section": section})
+        if state["log"]:
+            await ctx.warning("private MCP log notification")
+        if state["elicit"]:
+            await ctx.elicit("Supply more input", response_type=["yes", "no"])
+        await asyncio.sleep(state["delay"])
+        if state["error"]:
+            return ToolResult(content="Context unavailable. Ask the customer to try later.",
+                              is_error=True)
+        return ToolResult(
+            content="Current customer context",
+            structured_content={
+                "customer_id": customer_id,
+                "context": state["customers"][customer_id],
+                "section": section,
+            },
+        )
+
+    @server.tool(name="get_customer", description="Read recent activity from the context service.")
+    def activity(count: int = 1):
+        return f"Found {count} recent events"
+
+    app = server.http_app(
+        path="/custom/context", middleware=[Middleware(Authenticate)],
+        json_response=True, stateless_http=True,
+    )
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        state["url"] = f"http://127.0.0.1:{sock.getsockname()[1]}/custom/context"
+        runner = uvicorn.Server(uvicorn.Config(app, log_level="error", ws="none"))
+        thread = Thread(target=runner.run, kwargs={"sockets": [sock]}, daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 5
+            while not runner.started and thread.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert runner.started, "Test MCP server did not start"
+            yield state
+        finally:
+            runner.should_exit = True
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "Test MCP server did not stop"

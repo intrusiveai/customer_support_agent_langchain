@@ -150,7 +150,8 @@ be interpreted as a failed refund. Successful invocations retain the same
 
 The modules separate agent construction, session handling, bounded tools,
 account operations, database transactions/schema checks, document retrieval,
-web retrieval and model-output validation. There is one agent and exactly five tools:
+web retrieval and model-output validation. There is one agent and five built-in tools,
+plus any tools discovered from an optionally configured MCP server:
 
 | Tool | Behavior and dependency |
 | --- | --- |
@@ -165,6 +166,84 @@ Tool results use `{outcome, data, error}`; errors have stable `code` and
 database errors, HTTP status errors, transport errors, unsupported content and
 empty responses have distinct outcomes/codes. Model calls, tool calls, graph
 steps, messages, result rows, passage text and web content all have limits.
+
+## Optional MCP server
+
+The agent can connect to an existing remote MCP server over Streamable HTTP.
+Configure the connection during application setup; no server endpoint, credentials
+or remote tool names are built into the agent. The server is operated separately
+and is not implemented by this project.
+
+For the CLI, supply environment variables or `.env` settings:
+
+```dotenv
+SUPPORT_MCP_URL=https://your-context-service.example/mcp
+SUPPORT_MCP_HEADERS={"Authorization":"Bearer your-server-token"}
+SUPPORT_MCP_CUSTOMER_ID_HEADER=X-Customer-ID
+SUPPORT_MCP_TIMEOUT_SECONDS=15
+SUPPORT_MCP_RESULT_CHAR_LIMIT=12000
+```
+
+Use the endpoint and header names expected by your server. Library hosts can
+supply the same settings directly when setting up an application:
+
+```python
+settings = Settings(
+    mcp_url=context_server_url,
+    mcp_headers=context_server_headers,
+    mcp_customer_id_header=context_server_customer_header,
+)
+with SupportApplication(settings) as app:
+    session = app.start_session(authenticated_customer_id)
+    response = invoke_support(app, session, "What is happening with my support request?")
+```
+
+These variables come from the host's configuration and authentication flow.
+The usual database and model settings still apply.
+
+| Parameter | Default | Behavior |
+| --- | --- | --- |
+| `SUPPORT_MCP_URL` | Unset | Remote HTTP(S) MCP endpoint. Unset means no discovery, connections or extra tools. Use HTTPS for remote deployments; HTTP supports local servers. |
+| `SUPPORT_MCP_HEADERS` | `{}` | JSON object of authentication or other static HTTP headers, used for discovery and tool calls. Values are stored as secrets. |
+| `SUPPORT_MCP_CUSTOMER_ID_HEADER` | Unset | Required when MCP is enabled. Name of a custom header carrying the authenticated customer's ID on tool calls. Must not conflict with static or protocol headers. |
+| `SUPPORT_MCP_TIMEOUT_SECONDS` | `15` | Deadline for discovery or an individual tool request, including connection setup; greater than zero and at most 120 seconds. |
+| `SUPPORT_MCP_RESULT_CHAR_LIMIT` | `12000` | Maximum serialized tool-result characters forwarded to the model (1–1,000,000). This limits model context after receipt, not HTTP download size. |
+
+At setup, the client discovers the server's tool catalog and registers every
+advertised tool with its server-provided description and input schema. Remote
+names have an `mcp_` prefix to avoid collisions with built-in tools. The server
+controls instructions about when to fetch context, freshness, and how to explain
+unavailable context. The agent does not add MCP instructions to its system prompt,
+automatically fetch context each turn, or cache customer results. Each model-selected
+call queries the server again. Create a new application to pick up a changed tool catalog.
+
+Discovery uses the configured service credentials without a customer header.
+Tool calls add the customer ID from the trusted session to the configured header,
+percent-encoded as UTF-8 (the server should URL-decode it). The model cannot set
+this header, the endpoint or authentication credentials. The MCP server must
+authenticate the client and authorize each customer lookup; the header alone is
+not authentication. Tool arguments remain defined by the server, including any
+customer-related arguments, which the server must check against the trusted identity.
+Each call owns its connection, so concurrent sessions do not share identity headers.
+Redirects are not followed and environment proxies/netrc are not used.
+
+Results use the existing `{outcome, data, error}` format. `data.content` preserves
+the returned MCP content blocks; `data.structured_content` preserves structured
+results. Server-reported tool errors retain their content for the model and use
+`mcp_tool_error`. Timeouts, transport/protocol failures and oversized results use
+`mcp_timeout`, `mcp_unavailable` and `mcp_result_limit`, respectively. These tool
+failures let the model respond without marking the whole session failed. The
+client does not automatically retry calls. A configured server that cannot be
+discovered stops application startup with `mcp_configuration`.
+
+MCP calls count toward the existing per-interaction tool limit and log IDs,
+duration and outcomes through the existing logging configuration. Application
+logs omit response contents and credentials; server log notifications are not forwarded.
+The synchronous CLI/Python interface
+is unchanged; an async host should perform setup and invocation in a worker
+thread. This integration covers tools; it does not load MCP prompts or resources
+into the system prompt, or implement interactive server requests such as sampling
+or elicitation. It uses LangChain's beta MCP tool adapter, pinned by `uv.lock`.
 
 ## Database contract
 
@@ -506,6 +585,9 @@ chat/embedding providers with real pgvector retrieval. A table containing both
 OpenAI and Titan vectors verifies model/dimension filtering. Tests capture
 standard logs to check failure diagnostics and credential exclusion, and invoke
 the CLI to verify default stderr logging, optional file logging and level filtering.
+A test-only MCP server exercises dynamic tool discovery, supplied descriptions and
+schemas, authentication, customer isolation, fresh results across turns, tool limits,
+error recovery and the CLI with MCP enabled. No external MCP service is needed.
 Controlled responses with norm `1.0004726255` exercise document ingestion,
 storage and retrieval for both embedding providers. Numerical regression tests
 cover repeated normalization, invalid shapes/values and unsafe norms; stored

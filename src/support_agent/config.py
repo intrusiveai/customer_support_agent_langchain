@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import AliasChoices, Field, SecretStr, model_validator
+from pydantic import AliasChoices, Field, HttpUrl, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 EMBEDDING_MODEL = "text-embedding-3-large"
@@ -17,6 +17,13 @@ class Settings(BaseSettings):
     database_url: SecretStr
     log_file: str | None = Field(default=None, min_length=1)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    mcp_url: HttpUrl | None = None
+    mcp_headers: dict[str, SecretStr] = Field(default_factory=dict)
+    mcp_customer_id_header: str | None = Field(
+        default=None, pattern=r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+    )
+    mcp_timeout_seconds: float = Field(15, gt=0, le=120)
+    mcp_result_char_limit: int = Field(12000, ge=1, le=1000000)
     model_provider: str = "openai"
     model_name: str
     model_api_key: SecretStr | None = None
@@ -66,6 +73,31 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_settings(self):
+        if self.mcp_url is not None:
+            if self.mcp_url.username or self.mcp_url.password or self.mcp_url.fragment:
+                raise ValueError(
+                    "mcp_url must not contain credentials or a fragment; use mcp_headers"
+                )
+            if not self.mcp_customer_id_header:
+                raise ValueError("mcp_customer_id_header is required when mcp_url is configured")
+        if self.mcp_customer_id_header:
+            header = self.mcp_customer_id_header.lower()
+            if (
+                header.startswith("mcp-")
+                or header in {name.lower() for name in self.mcp_headers}
+                or header
+                in {
+                    "authorization",
+                    "host",
+                    "cookie",
+                    "content-type",
+                    "content-length",
+                    "accept",
+                    "mcp-session-id",
+                    "mcp-protocol-version",
+                }
+            ):
+                raise ValueError("mcp_customer_id_header must be a separate custom identity header")
         if self.pool_min > self.pool_max:
             raise ValueError("pool_min must not exceed pool_max")
         # Runtime-configurable model fields would let callers replace trusted settings.

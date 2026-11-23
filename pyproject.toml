@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Intentionally SQL-injectable customer-support simulation agent"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-  "langchain>=1.2,<2",
+  "langchain[mcp]>=1.4.7,<2",
   "langchain-openai>=1.1,<2",
   "langchain-anthropic>=1,<2",
   "langchain-aws>=1,<2",
@@ -20,6 +20,7 @@ dependencies = [
   "numpy>=2,<3",
   "pydantic-settings>=2.10,<3",
   "httpx>=0.28,<0.29",
+  "httpx2>=2.16,<3",
   "beautifulsoup4>=4.13,<5",
 ]
 
